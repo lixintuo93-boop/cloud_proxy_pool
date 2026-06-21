@@ -1259,27 +1259,29 @@ class AgentDeployManager:
             )
             self._exec(client, kill_cmd, timeout=10)
 
-            # 2. 后台启动（Hidden 窗口 = 脱离 SSH 会话存活）
+            # 2. 后台启动（echo 写 bat → wmic 启动，完全脱离 SSH 会话）
             log_out = remote_dir + "\\server.log"
-            log_err = remote_dir + "\\server-error.log"
-            start_cmd = (
-                f"powershell -Command \""
-                f"$p = Start-Process -FilePath 'node' "
-                f"-ArgumentList '{entry_script}' "
-                f"-WorkingDirectory '{remote_dir}' "
-                f"-WindowStyle Hidden -PassThru "
-                f"-RedirectStandardOutput '{log_out}' "
-                f"-RedirectStandardError '{log_err}'; "
-                f"Start-Sleep -Seconds 4; "
-                f"if ($p.HasExited) {{ Write-Host 'EXITED:' $p.ExitCode }} "
-                f"else {{ Write-Host 'RUNNING PID:' $p.Id }}\""
+            bat_file = remote_dir + "\\start-server.bat"
+            # 用 cmd echo 写启动脚本（^> ^& 转义避免过早重定向）
+            write_cmd = (
+                f"echo @echo off > {bat_file} & "
+                f"echo cd /d {remote_dir} >> {bat_file} & "
+                f"echo node {entry_script} ^> {log_out} 2^>^&1 >> {bat_file}"
             )
+            self._exec(client, write_cmd, timeout=10)
+            # wmic 启动：进程归 SYSTEM，完全脱离 SSH 会话
+            start_cmd = f'wmic process call create "cmd /c {bat_file}"'
             self._log(f"[{host}] Windows 后台启动 node {entry_script}...", 'INFO')
-            out, err, code = self._exec(client, start_cmd, timeout=20)
-            self._log(f"[{host}] 启动结果: {out.strip()}", 'INFO')
-            if 'EXITED' in out:
-                self._log(f"[{host}] node 进程启动后立即退出，检查 {log_err}", 'ERROR')
-            time.sleep(2)
+            out, err, code = self._exec(client, start_cmd, timeout=15)
+            # 给 node 5 秒启动
+            time.sleep(5)
+            # 端口检测
+            check = f"netstat -ano 2>nul | findstr :{port} | findstr LISTENING"
+            check_out, _, check_code = self._exec(client, check, timeout=10)
+            if check_code == 0:
+                self._log(f"[{host}] 服务启动成功 ✅（端口 {port} 已监听）", 'SUCCESS')
+            else:
+                self._log(f"[{host}] 端口 {port} 未监听，检查 {log_out}", 'WARNING')
             return
 
         # --- Linux: PM2 ---
