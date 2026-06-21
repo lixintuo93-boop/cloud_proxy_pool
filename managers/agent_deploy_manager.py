@@ -1259,17 +1259,25 @@ class AgentDeployManager:
             )
             self._exec(client, kill_cmd, timeout=10)
 
-            # 2. 后台启动（cmd start /b 不阻塞 SSH，进程存活不依赖会话）
-            log_file = remote_dir + "\\server.log"
+            # 2. 后台启动（PowerShell Start-Process，stdout/stderr 分开写）
+            log_out = remote_dir + "\\server.log"
+            log_err = remote_dir + "\\server-error.log"
             start_cmd = (
-                f"cd /d {remote_dir} && "
-                f"start \"\" /b cmd /c \"node {entry_script} > {log_file} 2>&1\""
+                f"powershell -Command \""
+                f"Start-Process -NoNewWindow -FilePath 'node' "
+                f"-ArgumentList '{entry_script}' "
+                f"-WorkingDirectory '{remote_dir}' "
+                f"-RedirectStandardOutput '{log_out}' "
+                f"-RedirectStandardError '{log_err}'"
+                f"\""
             )
             self._log(f"[{host}] Windows 后台启动 node {entry_script}...", 'INFO')
             out, err, code = self._exec(client, start_cmd, timeout=15)
+            if code != 0:
+                self._log(f"[{host}] 启动命令失败({code}): {err[:120]}", 'ERROR')
             # 给 node 几秒启动
             time.sleep(4)
-            self._log(f"[{host}] Windows 服务已启动（日志: {log_file}）", 'SUCCESS')
+            self._log(f"[{host}] Windows 服务已启动（日志: {log_out}, 错误: {log_err}）", 'SUCCESS')
             return
 
         # --- Linux: PM2 ---
