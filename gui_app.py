@@ -3074,19 +3074,35 @@ class ProxyManagerGUI:
     # ──────────────────────────────────────────────────────────
     # 本地部署（无需 SSH，直接将 gamyy-core 部署到本机）
     # ──────────────────────────────────────────────────────────
+    # 禁止删除的系统路径（rmtree 保护）
+    _PROTECTED_PATHS = {
+        os.path.normpath(p) for p in [
+            os.environ.get('SystemDrive', 'C:') + os.sep,
+            'C:\\', 'D:\\', 'E:\\', 'F:\\', 'G:\\',
+            'C:\\Windows', 'C:\\Program Files', 'C:\\Program Files (x86)',
+            os.path.expanduser('~'), os.path.join(os.environ['SystemDrive'] + os.sep, 'Users'),
+        ]
+    }
+
     def _local_deploy(self):
-        """弹出目录选择，将 gamyy-core 完整部署到本机并启动"""
-        from tkinter import filedialog
+        """弹出目录选择，在所选目录内创建 gamyy-core 子目录并部署"""
+        from tkinter import filedialog, messagebox
         from config import _app_root, _resource_root, RESOURCE_DIR_NAME
 
-        default_dir = os.path.join(os.environ.get('SystemDrive', 'C:') + os.sep, 'opt', 'gamyy-core')
-        target = filedialog.askdirectory(
-            title='选择本地部署目录',
-            initialdir=default_dir if os.path.exists(default_dir) else os.path.expanduser('~'),
+        default_parent = os.path.join(os.environ.get('SystemDrive', 'C:') + os.sep, 'opt')
+        parent = filedialog.askdirectory(
+            title='选择部署父目录（会在其下创建 gamyy-core 子目录）',
+            initialdir=default_parent if os.path.exists(default_parent) else os.path.expanduser('~'),
         )
-        if not target:
+        if not parent:
             return
-        target = os.path.normpath(target)
+        parent = os.path.normpath(parent)
+        target = os.path.join(parent, 'gamyy-core')
+
+        # 安全检查：禁止选择系统关键目录
+        if os.path.normpath(parent + os.sep) in self._PROTECTED_PATHS:
+            messagebox.showerror("错误", f"不允许部署到系统关键路径：{parent}\n请选择一个普通目录（如 C:\\opt）")
+            return
 
         self._agent_log(f"本地部署 → {target}", 'INFO')
         self._agent_set_progress("本地部署：准备中...")
@@ -3108,20 +3124,24 @@ class ProxyManagerGUI:
                     self._agent_set_progress("本地部署失败：无部署源")
                     return
 
-                # 2. 复制文件
+                # 2. 清理旧部署（只删 gamyy-core 子目录下的文件，不动父目录）
                 self._agent_log(f"复制文件: {source} → {target}", 'INFO')
                 self._agent_set_progress("本地部署：复制文件中...")
                 import shutil
+                # 备份旧数据库（如果存在）
                 if os.path.exists(target):
-                    # 保留 data/*.db
                     for db in ['config.db', 'hospital.db', 'ticket_checker.db']:
                         src_db = os.path.join(target, 'data', db)
                         if os.path.exists(src_db):
                             bak = src_db + '.local_bak'
-                            shutil.copy2(src_db, bak)
-                            self._agent_log(f"已备份 {db} → {db}.local_bak", 'INFO')
-                shutil.rmtree(target, ignore_errors=True)
-                # 复制（排除 node_modules, .git, __pycache__）
+                            try:
+                                shutil.copy2(src_db, bak)
+                                self._agent_log(f"已备份 {db}", 'INFO')
+                            except Exception:
+                                pass
+                    # 只删 gamyy-core 子目录本身，不动父目录
+                    shutil.rmtree(target, ignore_errors=True)
+                # 复制源码
                 shutil.copytree(source, target,
                     ignore=shutil.ignore_patterns('node_modules', '.git', '__pycache__', '*.pyc'))
 
@@ -3158,7 +3178,6 @@ class ProxyManagerGUI:
 
                 # 5. 后台启动
                 self._agent_set_progress("本地部署：启动服务...")
-                import subprocess
                 log_file = os.path.join(target, 'server.log')
                 proc = subprocess.Popen(
                     ['node', 'web', 'server.js'],
