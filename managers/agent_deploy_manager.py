@@ -1259,25 +1259,27 @@ class AgentDeployManager:
             )
             self._exec(client, kill_cmd, timeout=10)
 
-            # 2. 后台启动（PowerShell Start-Process，stdout/stderr 分开写）
+            # 2. 后台启动（Hidden 窗口 = 脱离 SSH 会话存活）
             log_out = remote_dir + "\\server.log"
             log_err = remote_dir + "\\server-error.log"
             start_cmd = (
                 f"powershell -Command \""
-                f"Start-Process -NoNewWindow -FilePath 'node' "
+                f"$p = Start-Process -FilePath 'node' "
                 f"-ArgumentList '{entry_script}' "
                 f"-WorkingDirectory '{remote_dir}' "
+                f"-WindowStyle Hidden -PassThru "
                 f"-RedirectStandardOutput '{log_out}' "
-                f"-RedirectStandardError '{log_err}'"
-                f"\""
+                f"-RedirectStandardError '{log_err}'; "
+                f"Start-Sleep -Seconds 4; "
+                f"if ($p.HasExited) {{ Write-Host 'EXITED:' $p.ExitCode }} "
+                f"else {{ Write-Host 'RUNNING PID:' $p.Id }}\""
             )
             self._log(f"[{host}] Windows 后台启动 node {entry_script}...", 'INFO')
-            out, err, code = self._exec(client, start_cmd, timeout=15)
-            if code != 0:
-                self._log(f"[{host}] 启动命令失败({code}): {err[:120]}", 'ERROR')
-            # 给 node 几秒启动
-            time.sleep(4)
-            self._log(f"[{host}] Windows 服务已启动（日志: {log_out}, 错误: {log_err}）", 'SUCCESS')
+            out, err, code = self._exec(client, start_cmd, timeout=20)
+            self._log(f"[{host}] 启动结果: {out.strip()}", 'INFO')
+            if 'EXITED' in out:
+                self._log(f"[{host}] node 进程启动后立即退出，检查 {log_err}", 'ERROR')
+            time.sleep(2)
             return
 
         # --- Linux: PM2 ---
