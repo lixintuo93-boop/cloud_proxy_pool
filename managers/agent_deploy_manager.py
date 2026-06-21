@@ -875,6 +875,7 @@ class AgentDeployManager:
     def _write_deploy_status(self, server, status, mode=None):
         """部署完成后把结果写回 ssh_servers.last_deploy_status + deploy_mode"""
         try:
+            from database import ProxyDatabase
             db = ProxyDatabase()
             db.update_server_deploy_status(server['id'], status)
             if mode:
