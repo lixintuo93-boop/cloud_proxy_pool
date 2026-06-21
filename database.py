@@ -226,18 +226,6 @@ class ProxyDatabase:
         except Exception:
             return False
 
-    def get_failed_deploy_server_ids(self):
-        """返回 last_deploy_status='failed' 的所有服务器 id（用于 GUI '选择失败'）"""
-        try:
-            conn = sqlite3.connect(self.db_file)
-            cur = conn.cursor()
-            cur.execute("SELECT id FROM ssh_servers WHERE last_deploy_status = 'failed'")
-            ids = [r[0] for r in cur.fetchall()]
-            conn.close()
-            return ids
-        except Exception:
-            return []
-
     def add_local_proxy(self, ssh_server_id, name, port, host='127.0.0.1', group_name='1'):
         """添加本地代理"""
         conn = sqlite3.connect(self.db_file)

@@ -774,14 +774,6 @@ class AgentDeployManager:
         with self._deploying_lock:
             return set(self._deploying_ids)
 
-    def get_pending_deploy_server_ids(self):
-        """返回 last_deploy_status ∈ {'never', 'failed', None, ''} 的所有 server_id。
-        GUI "🆕 选择待部署" 按钮用。
-        """
-        servers = self.get_all_servers()
-        return [s['id'] for s in servers
-                if (s.get('last_deploy_status') or 'never') in ('never', 'failed')]
-
     def deploy_server(self, server, step_cb=None, mode='agent'):
         """
         完整部署流程，step_cb(msg) 在每个步骤回调供 GUI 实时显示。

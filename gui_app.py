@@ -2397,8 +2397,6 @@ class ProxyManagerGUI:
 
         ttk.Button(toolbar, text="全选", width=6, command=self._agent_select_all).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="取消", width=6, command=self._agent_deselect_all).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="⚠ 选择失败", width=10, command=self._agent_select_failed).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="🆕 选择待部署", width=12, command=self._agent_select_pending).pack(side=tk.LEFT, padx=2)
         self.agent_select_label = ttk.Label(toolbar, text="已选: 0", foreground="blue")
         self.agent_select_label.pack(side=tk.LEFT, padx=8)
 
@@ -2416,6 +2414,9 @@ class ProxyManagerGUI:
         ttk.Button(toolbar, text="📊 刷新状态", command=self._agent_refresh_status).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="📋 查看日志", command=self._agent_show_logs).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="💾 下载日志DB", command=self._agent_batch_download_db).pack(side=tk.LEFT, padx=2)
+
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
+        ttk.Button(toolbar, text="🖥 本地部署", command=self._local_deploy).pack(side=tk.LEFT, padx=2)
 
         self.agent_progress_label = ttk.Label(toolbar, text="", foreground="gray")
         self.agent_progress_label.pack(side=tk.RIGHT, padx=10)
@@ -2488,47 +2489,6 @@ class ProxyManagerGUI:
                 platform, deploy, dmode,
                 '—', '—', '—', '—', '',
             ))
-        self._agent_update_select_label()
-
-    def _agent_select_failed(self):
-        """选中所有 last_deploy_status='failed' 的服务器（用于"重试失败"流程）"""
-        # 直接从 DB 查（持久化，重启 GUI 也能用）
-        failed_ids = []
-        try:
-            if self.manager and self.manager.database:
-                failed_ids = self.manager.database.get_failed_deploy_server_ids()
-        except Exception:
-            failed_ids = []
-        if not failed_ids:
-            messagebox.showinfo("提示", "没有标记为部署失败的服务器")
-            return
-        # 把这些 ID 在当前 Treeview 里选中（不动其它已选项）
-        all_items = set(self.agent_tree.get_children())
-        for sid in failed_ids:
-            iid = str(sid)
-            if iid in all_items:
-                self.agent_selected_ids.add(sid)
-                self.agent_tree.set(iid, "选择", '✓')
-        self._agent_update_select_label()
-
-    def _agent_select_pending(self):
-        """选中所有 last_deploy_status ∈ {'never','failed'} 的服务器
-        （用于"加了批新代理，只想部署它们 + 上次失败的"场景）"""
-        pending_ids = []
-        if self.agent_manager:
-            try:
-                pending_ids = self.agent_manager.get_pending_deploy_server_ids()
-            except Exception:
-                pending_ids = []
-        if not pending_ids:
-            messagebox.showinfo("提示", "没有待部署的服务器（全部已成功部署）")
-            return
-        all_items = set(self.agent_tree.get_children())
-        for sid in pending_ids:
-            iid = str(sid)
-            if iid in all_items:
-                self.agent_selected_ids.add(sid)
-                self.agent_tree.set(iid, "选择", '✓')
         self._agent_update_select_label()
 
     def _agent_log(self, msg, level='INFO'):
@@ -3109,6 +3069,118 @@ class ProxyManagerGUI:
             ok = sum(1 for r in results if r['ok'])
             self._agent_set_progress(f"下载完成 ✅{ok} ❌{len(results)-ok}")
             self._agent_log(f"日志DB下载完成：{ok}/{len(results)} 成功，保存至 {target_dir}", 'SUCCESS')
+        self.run_async(run)
+
+    # ──────────────────────────────────────────────────────────
+    # 本地部署（无需 SSH，直接将 gamyy-core 部署到本机）
+    # ──────────────────────────────────────────────────────────
+    def _local_deploy(self):
+        """弹出目录选择，将 gamyy-core 完整部署到本机并启动"""
+        from tkinter import filedialog
+        from config import _app_root, _resource_root, RESOURCE_DIR_NAME
+
+        default_dir = os.path.join(os.environ.get('SystemDrive', 'C:') + os.sep, 'opt', 'gamyy-core')
+        target = filedialog.askdirectory(
+            title='选择本地部署目录',
+            initialdir=default_dir if os.path.exists(default_dir) else os.path.expanduser('~'),
+        )
+        if not target:
+            return
+        target = os.path.normpath(target)
+
+        self._agent_log(f"本地部署 → {target}", 'INFO')
+        self._agent_set_progress("本地部署：准备中...")
+
+        def run():
+            try:
+                # 1. 定位部署源
+                source = None
+                for d in [
+                    os.path.join(_app_root(), 'imported_source'),
+                    os.path.join(_app_root(), 'resources', RESOURCE_DIR_NAME),
+                    os.path.join(_resource_root(), 'resources', RESOURCE_DIR_NAME),
+                ]:
+                    if os.path.isdir(d) and os.path.isfile(os.path.join(d, 'web', 'server.js')):
+                        source = d
+                        break
+                if not source:
+                    self._agent_log("找不到 gamyy-core 部署源（请先同步或导入）", 'ERROR')
+                    self._agent_set_progress("本地部署失败：无部署源")
+                    return
+
+                # 2. 复制文件
+                self._agent_log(f"复制文件: {source} → {target}", 'INFO')
+                self._agent_set_progress("本地部署：复制文件中...")
+                import shutil
+                if os.path.exists(target):
+                    # 保留 data/*.db
+                    for db in ['config.db', 'hospital.db', 'ticket_checker.db']:
+                        src_db = os.path.join(target, 'data', db)
+                        if os.path.exists(src_db):
+                            bak = src_db + '.local_bak'
+                            shutil.copy2(src_db, bak)
+                            self._agent_log(f"已备份 {db} → {db}.local_bak", 'INFO')
+                shutil.rmtree(target, ignore_errors=True)
+                # 复制（排除 node_modules, .git, __pycache__）
+                shutil.copytree(source, target,
+                    ignore=shutil.ignore_patterns('node_modules', '.git', '__pycache__', '*.pyc'))
+
+                # 3. 检查 Node.js
+                self._agent_set_progress("本地部署：检查 Node.js...")
+                import subprocess
+                node_ok = False
+                try:
+                    v = subprocess.check_output(['node', '-v'], timeout=5).decode().strip()
+                    major = int(v.lstrip('v').split('.')[0])
+                    if major >= 18:
+                        self._agent_log(f"Node.js {v} OK", 'INFO')
+                        node_ok = True
+                except Exception:
+                    pass
+                if not node_ok:
+                    self._agent_log("未找到 Node.js >= 18，请先安装 Node.js 22 LTS", 'ERROR')
+                    self._agent_log("下载: https://nodejs.org/en/download", 'ERROR')
+                    self._agent_set_progress("本地部署失败：需要 Node.js >= 18")
+                    return
+
+                # 4. npm install
+                self._agent_set_progress("本地部署：npm install...")
+                self._agent_log("npm install（可能需要几分钟）...", 'INFO')
+                result = subprocess.run(
+                    ['npm', 'install', '--omit=dev', '--legacy-peer-deps'],
+                    cwd=target, capture_output=True, text=True, timeout=300,
+                )
+                if result.returncode != 0:
+                    self._agent_log(f"npm install 失败: {result.stderr[:300]}", 'ERROR')
+                    self._agent_set_progress("本地部署失败：npm install 出错")
+                    return
+                self._agent_log("npm install 完成", 'SUCCESS')
+
+                # 5. 后台启动
+                self._agent_set_progress("本地部署：启动服务...")
+                import subprocess
+                log_file = os.path.join(target, 'server.log')
+                proc = subprocess.Popen(
+                    ['node', 'web', 'server.js'],
+                    cwd=target,
+                    stdout=open(log_file, 'w'),
+                    stderr=subprocess.STDOUT,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                )
+                self._agent_log(f"已启动 node web/server.js (PID={proc.pid})", 'SUCCESS')
+                self._agent_log(f"日志: {log_file}", 'INFO')
+
+                # 6. 打开浏览器
+                time.sleep(2)
+                import webbrowser
+                webbrowser.open('http://localhost:3000')
+                self._agent_log("已打开 http://localhost:3000", 'SUCCESS')
+                self._agent_set_progress("本地部署完成 ✅")
+
+            except Exception as e:
+                self._agent_log(f"本地部署异常: {e}", 'ERROR')
+                self._agent_set_progress("本地部署失败")
+
         self.run_async(run)
 
     # 关闭流程的兜底超时（秒）：到点直接 destroy，未完成的 paramiko close 由进程退出回收
