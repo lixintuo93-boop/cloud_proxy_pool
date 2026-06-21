@@ -2462,13 +2462,12 @@ class ProxyManagerGUI:
     _DEPLOY_LABEL   = {'never': '未部署', 'success': '✅ 成功', 'failed': '❌ 失败'}
     _MODE_LABEL     = {'agent': '🔹 Agent', 'full': '🔶 完整'}
 
-    @staticmethod
-    def _format_deploy_mode(raw_mode):
+    def _format_deploy_mode(self, raw_mode):
         """把 'agent,full' 格式化为显示文本 '🔹 Agent + 🔶 完整'"""
         if not raw_mode:
             return '🔹 Agent'
         modes = [m.strip() for m in raw_mode.split(',') if m.strip()]
-        labels = [AgentTab._MODE_LABEL.get(m, m) for m in modes]
+        labels = [self._MODE_LABEL.get(m, m) for m in modes]
         return ' + '.join(labels)
 
     def _agent_load_servers(self):
