@@ -910,9 +910,16 @@ class AgentDeployManager:
         try:
             self._step(step_cb, '连接SSH...')
             client = self._connect(server)
-            self._step(step_cb, '停止PM2...')
-            out, _, _ = self._exec(client, f"pm2 stop {AGENT_PM2_NAME} 2>&1 || true", timeout=30)
-            self._log(f"[{host}] 停止: {out[:100]}", 'INFO')
+            is_windows = self._detect_os(client) == 'windows'
+            if is_windows:
+                self._step(step_cb, '停止 node...')
+                # 杀所有 node.exe（Windows 上没有 PM2，直接 taskkill）
+                self._exec(client, "taskkill /f /im node.exe 2>nul & echo done", timeout=15)
+                self._log(f"[{host}] 已停止所有 node 进程", 'INFO')
+            else:
+                self._step(step_cb, '停止PM2...')
+                out, _, _ = self._exec(client, f"pm2 stop {AGENT_PM2_NAME} 2>&1 || true", timeout=30)
+                self._log(f"[{host}] 停止: {out[:100]}", 'INFO')
             status = {'pm2': 'stopped', 'health': False, 'uptime': None, 'running_tasks': None}
             return {'ok': True, 'msg': 'stopped', 'status': status}
         except Exception as e:
@@ -931,8 +938,13 @@ class AgentDeployManager:
         try:
             self._step(step_cb, '连接SSH...')
             client = self._connect(server)
-            self._step(step_cb, '重启PM2...')
-            self._pm2_start_or_restart(client, host)
+            is_windows = self._detect_os(client) == 'windows'
+            if is_windows:
+                self._step(step_cb, '停止旧进程...')
+                self._exec(client, "taskkill /f /im node.exe 2>nul & echo done", timeout=15)
+                time.sleep(1)
+            self._step(step_cb, '重启服务...')
+            self._pm2_start_or_restart(client, host, mode='agent')
             self._step(step_cb, '健康检查...')
             time.sleep(1)
             health, uptime, running_tasks = self._health_check(client)
@@ -962,28 +974,42 @@ class AgentDeployManager:
         client = None
         try:
             client = self._connect(server, timeout=8)
+            is_windows = self._detect_os(client) == 'windows'
 
-            # PM2 状态：仍用 pm2 show 但放宽到 30s 兜底慢盘 / 进程多时的延迟
-            out, _, code = self._exec(
-                client,
-                f"pm2 show {AGENT_PM2_NAME} 2>/dev/null | grep -E 'status|uptime' || echo NOT_FOUND",
-                timeout=30,
-            )
-            if 'NOT_FOUND' in out or code != 0:
-                pm2_status = 'not_found'
-            elif 'online' in out.lower():
-                pm2_status = 'online'
-            elif 'stopped' in out.lower() or 'errored' in out.lower():
-                pm2_status = 'stopped'
+            if is_windows:
+                # Windows: 用 netstat 检测端口是否监听
+                out, _, code = self._exec(
+                    client,
+                    f"netstat -ano 2>nul | findstr :{AGENT_PORT} | findstr LISTENING >nul && echo online || echo stopped",
+                    timeout=15,
+                )
+                pm2_status = 'online' if 'online' in out else 'stopped'
+                # 健康检查用 PowerShell
+                health_cmd = (
+                    f"powershell -Command \"try {{ "
+                    f"$r=Invoke-WebRequest -Uri 'http://localhost:{AGENT_PORT}/health' "
+                    f"-UseBasicParsing -TimeoutSec 3; Write-Host $r.Content "
+                    f"}} catch {{ Write-Host 'FAIL' }}\""
+                )
             else:
-                pm2_status = 'unknown'
+                # PM2 状态
+                out, _, code = self._exec(
+                    client,
+                    f"pm2 show {AGENT_PM2_NAME} 2>/dev/null | grep -E 'status|uptime' || echo NOT_FOUND",
+                    timeout=30,
+                )
+                if 'NOT_FOUND' in out or code != 0:
+                    pm2_status = 'not_found'
+                elif 'online' in out.lower():
+                    pm2_status = 'online'
+                elif 'stopped' in out.lower() or 'errored' in out.lower():
+                    pm2_status = 'stopped'
+                else:
+                    pm2_status = 'unknown'
+                # HTTP 健康检查
+                health_cmd = f"curl -sf --max-time 3 http://localhost:{AGENT_PORT}/health 2>/dev/null || echo FAIL"
 
-            # HTTP 健康检查
-            health_out, _, _ = self._exec(
-                client,
-                f"curl -sf --max-time 3 http://localhost:{AGENT_PORT}/health 2>/dev/null || echo FAIL",
-                timeout=8,
-            )
+            health_out, _, _ = self._exec(client, health_cmd, timeout=8)
             health = '"status":"ok"' in health_out
 
             running_tasks = None
