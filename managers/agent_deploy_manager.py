@@ -41,8 +41,6 @@ from config import (
     AGENT_REMOTE_DB, AGENT_LOG_SAVE_DIR,
     AGENT_FULL_REMOTE_DIR, AGENT_FULL_PM2_NAME, AGENT_FULL_PORT,
     RESOURCE_DIR_NAME,
-    FP_SIDECAR_ENABLED, FP_SIDECAR_ADDR, FP_SIDECAR_PM2_NAME,
-    FP_SIDECAR_BINARY_REL, FP_SIDECAR_BINARY, FP_SIDECAR_REMOTE_SUBDIR, FP_SIDECAR_PROBE_TARGET,
     _app_root, _resource_root,
     get_beijing_time_str,
 )
@@ -90,7 +88,7 @@ def get_deploy_source():
 # 子目录名（在任意层级出现则跳过整棵子树）
 _FULL_EXCLUDE_DIRS = {
     'node_modules', '.git', '.idea', '.vscode', '__pycache__',
-    'fp-sidecar',  # sidecar 源码/二进制不随整树上传；Linux 二进制由 _deploy_fp_sidecar 显式上传
+   
 }
 # 文件名 fnmatch 模式
 _FULL_EXCLUDE_PATTERNS = [
@@ -837,23 +835,8 @@ class AgentDeployManager:
             self._log(f"[{host}] npm install（{'完整模式 ~3-5 分钟' if mode == 'full' else '首次约1~2分钟'}）...", 'INFO')
             self._npm_install_project(client, host, cloud, mode=mode)
 
-            # TLS 指纹 sidecar（开关控制）：先于 node 进程部署并拉起。
-            # 只有 sidecar 确实在线（sidecar_ok）才会给 node 注入 FP_SIDECAR_ADDR——
-            # 否则 agent 会连一个不存在的 sidecar，导致请求全部失败。
-            sidecar_ok = False
-            if FP_SIDECAR_ENABLED:
-                self._step(step_cb, '部署TLS指纹sidecar...')
-                remote_dir = self._resolve_remote_dir(client, mode)
-                if self._deploy_fp_sidecar(client, host, remote_dir, source_root):
-                    self._pm2_start_sidecar(client, host, remote_dir)
-                    self._step(step_cb, 'sidecar健康检查...')
-                    time.sleep(1)
-                    sidecar_ok = self._health_check_sidecar(client, host)
-                if not sidecar_ok:
-                    self._log(f"[{host}] sidecar 未就绪，node 进程保持原生 TLS（不注入 FP_SIDECAR_ADDR）", 'WARNING')
-
-            self._step(step_cb, '启动PM2...')
-            self._pm2_start_or_restart(client, host, mode=mode, inject_fp_env=sidecar_ok)
+            self._step(step_cb, '启动服务...')
+            self._pm2_start_or_restart(client, host, mode=mode)
 
             self._step(step_cb, '健康检查...')
             time.sleep(2)
@@ -1249,98 +1232,7 @@ class AgentDeployManager:
 
         return results
 
-    # ──────────────────────────────────────────────────────────
-    # 内部工具
-    # ──────────────────────────────────────────────────────────
-    def _deploy_fp_sidecar(self, client, host, remote_dir, source_root):
-        """上传 fp-sidecar Linux 二进制到 remote_dir/fp-sidecar/ 并 chmod +x。
-        返回 True=二进制已就位；False=本地缺二进制（跳过，不阻断部署）。
-        """
-        # 优先用部署源副本里的二进制；副本通常不含编译产物，回退到稳定构建目录 FP_SIDECAR_BINARY。
-        local_bin = os.path.join(source_root, FP_SIDECAR_BINARY_REL)
-        if not os.path.isfile(local_bin):
-            local_bin = FP_SIDECAR_BINARY
-        if not os.path.isfile(local_bin):
-            self._log(f"[{host}] 未找到本地 sidecar 二进制（源副本与 {FP_SIDECAR_BINARY} 均无），跳过 sidecar 部署"
-                      f"（需先 GOOS=linux GOARCH=amd64 go build 产出 Linux 二进制）", 'WARNING')
-            return False
-        self._log(f"[{host}] 使用 sidecar 二进制: {local_bin}", 'INFO')
-        remote_sub = f"{remote_dir}/{FP_SIDECAR_REMOTE_SUBDIR}"
-        remote_bin = f"{remote_sub}/fp-sidecar"
-        sftp = client.open_sftp()
-        try:
-            self._sftp_mkdir_p(sftp, remote_sub)
-            sftp.put(local_bin, remote_bin)
-        finally:
-            sftp.close()
-        self._exec(client, f"chmod +x {remote_bin}", timeout=15)
-        self._log(f"[{host}] sidecar 二进制已上传 {remote_bin}", 'SUCCESS')
-        return True
-
-    def _pm2_start_sidecar(self, client, host, remote_dir):
-        """PM2 启动/重启 fp-sidecar（监听 FP_SIDECAR_ADDR）。"""
-        remote_bin = f"{remote_dir}/{FP_SIDECAR_REMOTE_SUBDIR}/fp-sidecar"
-        out, _, _ = self._exec(
-            client,
-            f"pm2 jlist 2>/dev/null | grep -q '\"name\":\"{FP_SIDECAR_PM2_NAME}\"' && echo EXISTS || echo NOTEXIST",
-            timeout=30,
-        )
-        if 'EXISTS' in out:
-            self._log(f"[{host}] PM2 重启 {FP_SIDECAR_PM2_NAME}...", 'INFO')
-            self._exec(client, f"pm2 restart {FP_SIDECAR_PM2_NAME}", timeout=30)
-        else:
-            self._log(f"[{host}] PM2 首次启动 {FP_SIDECAR_PM2_NAME}（{FP_SIDECAR_ADDR}）...", 'INFO')
-            self._exec(
-                client,
-                f"pm2 start {remote_bin} --name {FP_SIDECAR_PM2_NAME} --interpreter none -- -addr {FP_SIDECAR_ADDR}",
-                timeout=30,
-            )
-        self._exec(client, "pm2 save", timeout=30)
-        self._log(f"[{host}] sidecar 启动完成", 'SUCCESS')
-
-    def _health_check_sidecar(self, client, host):
-        """部署后健康检查：确认 sidecar 端口在听 + 隧道能连目标。
-        功能探测：向 sidecar 发一个 CONNECT（preset 指纹，直连目标），回 200 即证明
-        "端口起来了 + 隧道能连上"。未回 200 时再用 pm2 区分"进程没起"与"起了但目标不可达"。
-        返回 True=隧道连通；False=未连通（已记日志，不阻断部署）。
-        """
-        import json
-        import base64
-        fp = base64.b64encode(json.dumps(
-            {"mode": "preset", "clientHello": "HelloChrome_Auto", "alpn": ["h2", "http/1.1"]}
-        ).encode()).decode()
-
-        ci = FP_SIDECAR_ADDR.rfind(':')
-        shost = FP_SIDECAR_ADDR[:ci] or '127.0.0.1'
-        sport = FP_SIDECAR_ADDR[ci + 1:]
-        target = FP_SIDECAR_PROBE_TARGET
-
-        # bash /dev/tcp 发 CONNECT，读首行响应。connect 失败则 resp 为空。
-        probe = (
-            f"exec 3<>/dev/tcp/{shost}/{sport} 2>/dev/null && "
-            f"printf 'CONNECT {target} HTTP/1.1\\r\\nHost: {target}\\r\\nX-Fingerprint: {fp}\\r\\n\\r\\n' >&3 && "
-            f"timeout 6 head -1 <&3; exec 3<&- 3>&- 2>/dev/null"
-        )
-        resp, _, _ = self._exec(client, f"bash -c \"{probe}\"", timeout=12)
-
-        if '200' in resp:
-            self._log(f"[{host}] sidecar 健康检查通过：{shost}:{sport} 在听，隧道可连 {target} ✅", 'SUCCESS')
-            return True
-
-        pm2_out, _, _ = self._exec(
-            client,
-            f"pm2 jlist 2>/dev/null | grep -q '\"name\":\"{FP_SIDECAR_PM2_NAME}\"' && echo UP || echo DOWN",
-            timeout=15,
-        )
-        if 'UP' in pm2_out:
-            # 进程在线、端口可用 → 视为可用（可注入 env）；目标可达性是另一回事（网络层）
-            self._log(f"[{host}] sidecar 进程在线但隧道探测未通（目标 {target} 可能不可达/被防火墙拦），"
-                      f"resp={resp.strip()[:80]}", 'WARNING')
-            return True
-        self._log(f"[{host}] sidecar 未在线（PM2 无 {FP_SIDECAR_PM2_NAME}），端口 {sport} 未起", 'ERROR')
-        return False
-
-    def _pm2_start_or_restart(self, client, host, mode='agent', inject_fp_env=False):
+    def _pm2_start_or_restart(self, client, host, mode='agent'):
         """启动/重启服务进程。
 
         Linux: PM2 管理
@@ -1357,8 +1249,6 @@ class AgentDeployManager:
             entry_script = 'agent/server.js'
             port = AGENT_PORT
         remote_dir = self._resolve_remote_dir(client, mode)
-
-        env_prefix = f"FP_SIDECAR_ADDR={FP_SIDECAR_ADDR} " if inject_fp_env else ""
 
         if is_windows:
             # --- Windows: 直接 node 后台进程 ---
@@ -1396,13 +1286,12 @@ class AgentDeployManager:
         out, _, code = self._exec(client, detect_cmd, timeout=30)
         if 'EXISTS' in out:
             self._log(f"[{host}] PM2 重启 {proc_name}...", 'INFO')
-            restart_flag = ' --update-env' if inject_fp_env else ''
-            self._exec(client, f"{env_prefix}pm2 restart {proc_name}{restart_flag}", timeout=30)
+            self._exec(client, f"pm2 restart {proc_name}", timeout=30)
         else:
             self._log(f"[{host}] PM2 首次启动 {proc_name}...", 'INFO')
             self._exec(
                 client,
-                f"cd {remote_dir} && {env_prefix}pm2 start {entry_script} --name {proc_name}",
+                f"cd {remote_dir} && pm2 start {entry_script} --name {proc_name}",
                 timeout=30,
             )
         self._exec(client, "pm2 save", timeout=30)
