@@ -103,6 +103,11 @@ _FULL_EXCLUDE_SPECIFIC = {
     os.path.join('data', 'ticket_checker.db'),     # 远端运行时生成
 }
 
+#  Windows 远程部署路径（与 Linux /opt/... 区分）
+#  使用正斜杠兼容 cmd.exe 和 SFTP
+AGENT_WINDOWS_REMOTE_DIR = "C:/opt/gamyy-agent"
+AGENT_WINDOWS_FULL_REMOTE_DIR = "C:/opt/gamyy-core"
+
 
 def _should_skip_full(rel_path, is_dir):
     """完整模式 sftp 上传/sync 时的过滤器。
@@ -135,6 +140,7 @@ class AgentDeployManager:
         # 防止同一台服务器被两批部署任务并发撞 SSH/SFTP/npm 导致状态损坏
         self._deploying_ids = set()
         self._deploying_lock = threading.Lock()
+        self._os_cache = {}  # id(client) -> 'windows' | 'linux'
 
     # ──────────────────────────────────────────────────────────
     # 日志
@@ -279,9 +285,22 @@ class AgentDeployManager:
         err = stderr.read().decode('utf-8', errors='replace').strip()
         return out, err, exit_code
 
+    def _detect_os(self, client):
+        """检测远程服务器操作系统类型，返回 'windows' 或 'linux'（结果按连接缓存）。"""
+        cid = id(client)
+        if cid in self._os_cache:
+            return self._os_cache[cid]
+        out, _, code = self._exec(client, "ver", timeout=5)
+        result = 'windows' if (code == 0 and 'Windows' in out) else 'linux'
+        self._os_cache[cid] = result
+        return result
+
     def _is_cmd_available(self, client, cmd):
-        """检查命令是否可用（exit 0）"""
-        _, _, code = self._exec(client, f"command -v {cmd} >/dev/null 2>&1", timeout=10)
+        """检查命令是否可用（exit 0）；兼容 Linux 与 Windows。"""
+        if self._detect_os(client) == 'windows':
+            _, _, code = self._exec(client, f"where {cmd} >nul 2>&1", timeout=10)
+        else:
+            _, _, code = self._exec(client, f"command -v {cmd} >/dev/null 2>&1", timeout=10)
         return code == 0
 
     def _get_cmd_version(self, client, cmd):
@@ -293,7 +312,21 @@ class AgentDeployManager:
     # SFTP 上传
     # ──────────────────────────────────────────────────────────
     def _sftp_mkdir_p(self, sftp, remote_path):
-        """递归创建远端目录"""
+        """递归创建远端目录（兼容 Linux /opt/... 和 Windows C:/opt/...）"""
+        # Windows 路径格式：C:/opt/gamyy-agent → 跳过盘符，从 C:/opt 开始创建
+        if len(remote_path) >= 2 and remote_path[1] == ':':
+            parts = remote_path.replace('\\', '/').split('/')
+            if not parts[-1]:
+                parts.pop()
+            for i in range(2, len(parts) + 1):
+                current = '/'.join(parts[:i])
+                try:
+                    sftp.stat(current)
+                except FileNotFoundError:
+                    sftp.mkdir(current)
+            return
+
+        # Linux 路径格式：/opt/gamyy-agent
         parts = remote_path.rstrip('/').split('/')
         current = ''
         for part in parts:
@@ -343,15 +376,23 @@ class AgentDeployManager:
         mode='full' : 完整模式，递归上传整个 source_root（按 _should_skip_full 排除）+ 完整 package.json
         """
         src = source_root or AGENT_SOURCE_DIR
-        remote_dir = AGENT_FULL_REMOTE_DIR if mode == 'full' else AGENT_REMOTE_DIR
+        is_windows = self._detect_os(client) == 'windows'
+        remote_dir = self._resolve_remote_dir(client, mode)
 
-        # 非 root 用户（如腾讯云 ubuntu）无法直接写 /opt/，先用 sudo 建目录并授权
-        self._exec(
-            client,
-            f"sudo mkdir -p {remote_dir}/data && "
-            f"sudo chown -R $(whoami):$(whoami) {remote_dir}",
-            timeout=30
-        )
+        # 建目录并授权（Linux 需要 sudo；Windows 不需要）
+        if is_windows:
+            self._exec(
+                client,
+                f"mkdir {remote_dir}\\data 2>nul & mkdir {remote_dir} 2>nul",
+                timeout=15
+            )
+        else:
+            self._exec(
+                client,
+                f"sudo mkdir -p {remote_dir}/data && "
+                f"sudo chown -R $(whoami):$(whoami) {remote_dir}",
+                timeout=30
+            )
         sftp = client.open_sftp()
         try:
             self._sftp_mkdir_p(sftp, remote_dir)
@@ -406,50 +447,71 @@ class AgentDeployManager:
         url = _MIRRORS.get(cloud, _MIRRORS['default'])['npm']
         return f"--registry={url} " if url else ""
 
+    def _resolve_remote_dir(self, client, mode='agent'):
+        """根据远程 OS 返回部署目录：Linux /opt/...，Windows C:\opt\..."""
+        if self._detect_os(client) == 'windows':
+            return AGENT_WINDOWS_FULL_REMOTE_DIR if mode == 'full' else AGENT_WINDOWS_REMOTE_DIR
+        return AGENT_FULL_REMOTE_DIR if mode == 'full' else AGENT_REMOTE_DIR
+
     def _ensure_nodejs(self, client, server_host, cloud='default'):
-        """确保 Node.js >= 18，不满足则安装 Node.js 20。
+        """确保 Node.js >= 18，不满足则安装 Node.js 22。
+
+        Linux: apt-get / yum + nodesource setup_20.x
+        Windows: PowerShell 下载 MSI → msiexec 静默安装
 
         失败重试策略：单次 90s，最多 8 次尝试，间隔 3/8/15/25/40/60/90s + 0~50% 抖动。
-        重试前清理 apt/yum 残留 lock 与进程，避免锁冲突连环失败。
-        超时与非零退出码都纳入重试。
-
-        cloud='aliyun' 时手工配置阿里云 nodesource apt 仓库；
-        其它（含 'tencent'/'default'）走官方 setup_20.x 脚本。
         """
-        out, _, code = self._exec(client, "node -v 2>/dev/null || echo NOT_FOUND", timeout=10)
+        is_windows = self._detect_os(client) == 'windows'
+
+        # --- 版本检测（兼容 Windows cmd.exe 和 Linux bash）---
+        detect_cmd = "node -v 2>nul || echo NOT_FOUND" if is_windows else "node -v 2>/dev/null || echo NOT_FOUND"
+        out, _, code = self._exec(client, detect_cmd, timeout=10)
         if code == 0 and out.startswith('v'):
             major = int(out.lstrip('v').split('.')[0])
             if major >= 18:
                 self._log(f"[{server_host}] Node.js {out} 已安装，跳过", 'INFO')
                 return True
 
-        # 全部走官方 setup_20.x 脚本（cloud 参数当前不再驱动镜像选择，仅作标签用途）
-        install_cmd = (
-            "if command -v apt-get &>/dev/null; then "
-            "  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash - && sudo apt-get install -y nodejs; "
-            "elif command -v yum &>/dev/null; then "
-            "  curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash - && sudo yum install -y nodejs; "
-            "fi"
-        )
-        # 重试前清理：杀残留 apt/yum 进程、删 lock 文件、修 dpkg 半截状态、
-        # 同时清掉上次失败留下的 nodesource.list 与可能为空的 GPG keyring，避免反复败在同一处
-        cleanup_cmd = (
-            "if command -v apt-get &>/dev/null; then "
-            "  sudo pkill -9 apt-get apt dpkg 2>/dev/null || true; "
-            "  sudo rm -f /var/lib/apt/lists/lock /var/lib/apt/lists/lock-frontend "
-            "    /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock 2>/dev/null || true; "
-            "  sudo rm -f /etc/apt/sources.list.d/nodesource.list /usr/share/keyrings/nodesource.gpg 2>/dev/null || true; "
-            "  sudo dpkg --configure -a 2>/dev/null || true; "
-            "elif command -v yum &>/dev/null; then "
-            "  sudo pkill -9 yum dnf 2>/dev/null || true; "
-            "  sudo rm -f /var/run/yum.pid /etc/yum.repos.d/nodesource.repo 2>/dev/null || true; "
-            "fi"
-        )
+        # --- 安装命令（Windows vs Linux）---
+        if is_windows:
+            msi_url = "https://nodejs.org/dist/v22.14.0/node-v22.14.0-x64.msi"
+            install_cmd = (
+                f"powershell -Command \""
+                f"$msi=join-path $env:TEMP 'node-v22.14.0-x64.msi'; "
+                f"Write-Host 'Downloading Node.js 22 LTS...'; "
+                f"Invoke-WebRequest -Uri '{msi_url}' -OutFile $msi -UseBasicParsing; "
+                f"Write-Host 'Installing...'; "
+                f"Start-Process msiexec.exe -ArgumentList '/i',$msi,'/qn','/norestart' -Wait; "
+                f"Remove-Item $msi -Force; "
+                f"Write-Host 'Done'"
+                f"\""
+            )
+            cleanup_cmd = None  # Windows 不需要 Linux 式清理
+        else:
+            install_cmd = (
+                "if command -v apt-get &>/dev/null; then "
+                "  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash - && sudo apt-get install -y nodejs; "
+                "elif command -v yum &>/dev/null; then "
+                "  curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash - && sudo yum install -y nodejs; "
+                "fi"
+            )
+            cleanup_cmd = (
+                "if command -v apt-get &>/dev/null; then "
+                "  sudo pkill -9 apt-get apt dpkg 2>/dev/null || true; "
+                "  sudo rm -f /var/lib/apt/lists/lock /var/lib/apt/lists/lock-frontend "
+                "    /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock 2>/dev/null || true; "
+                "  sudo rm -f /etc/apt/sources.list.d/nodesource.list /usr/share/keyrings/nodesource.gpg 2>/dev/null || true; "
+                "  sudo dpkg --configure -a 2>/dev/null || true; "
+                "elif command -v yum &>/dev/null; then "
+                "  sudo pkill -9 yum dnf 2>/dev/null || true; "
+                "  sudo rm -f /var/run/yum.pid /etc/yum.repos.d/nodesource.repo 2>/dev/null || true; "
+                "fi"
+            )
 
         max_attempts = self._NODEJS_MAX_ATTEMPTS
         last_reason = ''
         for attempt in range(1, max_attempts + 1):
-            self._log(f"[{server_host}] 安装 Node.js 20 LTS（尝试 {attempt}/{max_attempts}）...", 'INFO')
+            self._log(f"[{server_host}] 安装 Node.js 22 LTS（尝试 {attempt}/{max_attempts}）...", 'INFO')
             try:
                 _, err, code = self._exec(client, install_cmd, timeout=self._NODEJS_SINGLE_TIMEOUT)
                 if code == 0:
@@ -460,13 +522,13 @@ class AgentDeployManager:
                 last_reason = f"超时({self._NODEJS_SINGLE_TIMEOUT}s)"
 
             if attempt < max_attempts:
-                # 清理残留 lock，避免下次 apt 卡在锁上
-                try:
-                    self._exec(client, cleanup_cmd, timeout=15)
-                except Exception:
-                    pass
+                if cleanup_cmd and not is_windows:
+                    try:
+                        self._exec(client, cleanup_cmd, timeout=15)
+                    except Exception:
+                        pass
                 base = self._NODEJS_BACKOFFS[attempt - 1]
-                wait = base + random.uniform(0, base * 0.5)  # 抖动 0~50%
+                wait = base + random.uniform(0, base * 0.5)
                 self._log(
                     f"[{server_host}] Node.js 安装失败（{last_reason}），{wait:.1f}s 后重试 ({attempt+1}/{max_attempts})...",
                     'WARNING',
@@ -477,13 +539,16 @@ class AgentDeployManager:
 
     def _ensure_pm2(self, client, server_host, cloud='default'):
         """确保 PM2 已安装。失败重试 7 次×60s，间隔 3/8/15/25/40/60s + 0~50% 抖动；按云走 npm 镜像。"""
-        out, _, code = self._exec(client, "pm2 -v 2>/dev/null || echo NOT_FOUND", timeout=10)
+        is_windows = self._detect_os(client) == 'windows'
+        detect_cmd = "pm2 -v 2>nul || echo NOT_FOUND" if is_windows else "pm2 -v 2>/dev/null || echo NOT_FOUND"
+        out, _, code = self._exec(client, detect_cmd, timeout=10)
         if code == 0 and out != 'NOT_FOUND' and out.strip():
             self._log(f"[{server_host}] PM2 {out} 已安装，跳过", 'INFO')
             return True
 
         registry = self._npm_registry_arg(cloud)
-        install_cmd = f"sudo npm install -g {registry}pm2"
+        sudo = "" if is_windows else "sudo "
+        install_cmd = f"{sudo}npm install -g {registry}pm2"
 
         max_attempts = self._PM2_MAX_ATTEMPTS
         last_reason = ''
@@ -515,14 +580,24 @@ class AgentDeployManager:
         mode='agent': 在 AGENT_REMOTE_DIR 下用上传的精简 package.json 装
         mode='full' : 在 AGENT_FULL_REMOTE_DIR 下用完整 package.json 装（含 express/better-sqlite3 等，编译耗时）
         """
+        is_windows = self._detect_os(client) == 'windows'
         registry = self._npm_registry_arg(cloud)
-        remote_dir = AGENT_FULL_REMOTE_DIR if mode == 'full' else AGENT_REMOTE_DIR
-        npm_cmd = (
-            f"cd {remote_dir} && "
-            "rm -rf node_modules package-lock.json 2>/dev/null; "
-            "NODE_OPTIONS='--max-old-space-size=512' "
-            f"npm install {registry}--omit=dev --legacy-peer-deps 2>&1"
-        )
+        remote_dir = self._resolve_remote_dir(client, mode)
+        if is_windows:
+            npm_cmd = (
+                f"cd /d {remote_dir} && "
+                "rmdir /s /q node_modules 2>nul & "
+                "del package-lock.json 2>nul & "
+                f"set NODE_OPTIONS=--max-old-space-size=512 && "
+                f"npm install {registry}--omit=dev --legacy-peer-deps 2>&1"
+            )
+        else:
+            npm_cmd = (
+                f"cd {remote_dir} && "
+                "rm -rf node_modules package-lock.json 2>/dev/null; "
+                "NODE_OPTIONS='--max-old-space-size=512' "
+                f"npm install {registry}--omit=dev --legacy-peer-deps 2>&1"
+            )
 
         max_attempts = self._NPM_MAX_ATTEMPTS
         last_reason = ''
@@ -549,7 +624,15 @@ class AgentDeployManager:
         raise RuntimeError(f"npm install 失败（已尝试 {max_attempts} 次）：{last_reason[:300]}")
 
     def _ensure_build_tools(self, client, server_host):
-        """确保编译工具链已安装（sqlite3 原生模块需要）"""
+        """确保编译工具链已安装（sqlite3 原生模块需要）。
+
+        Linux: apt-get / yum 安装 build-essential + libsqlite3-dev。
+        Windows: 跳过（better-sqlite3/sqlite3 有预编译二进制，无需编译工具）。
+        """
+        if self._detect_os(client) == 'windows':
+            self._log(f"[{server_host}] Windows 环境，跳过编译工具安装（使用预编译原生模块）", 'INFO')
+            return
+
         # 检测 gcc 是否可用作为编译工具存在的代理指标
         gcc_ok, _, _ = self._exec(client, "dpkg -l build-essential 2>/dev/null | grep -q '^ii' && echo OK || echo NO", timeout=10)
         if gcc_ok.strip() == 'OK':
@@ -634,31 +717,31 @@ class AgentDeployManager:
         return detected
 
     def _health_check(self, client, mode='agent'):
-        """执行 HTTP 健康检查，返回 (health:bool, uptime, running_tasks)
-
-        mode='agent': curl localhost:7070/health，解析 JSON 拿 uptime/runningTasks
-        mode='full' : curl localhost:3000/，只要返回 2xx/3xx 即算 OK；web/server.js 没有 /health
-                       端点，所以 uptime/runningTasks 返回 None
-        """
+        """执行 HTTP 健康检查，返回 (health:bool, uptime, running_tasks)"""
         import json
+        is_windows = self._detect_os(client) == 'windows'
+
         if mode == 'full':
-            code_out, _, _ = self._exec(
-                client,
+            curl_cmd = (
+                f"curl -s -o nul --max-time 3 -w '%{{http_code}}' "
+                f"http://localhost:{AGENT_FULL_PORT}/ 2>nul || echo 000"
+                if is_windows else
                 f"curl -s -o /dev/null --max-time 3 -w '%{{http_code}}' "
-                f"http://localhost:{AGENT_FULL_PORT}/ 2>/dev/null || echo 000",
-                timeout=8,
+                f"http://localhost:{AGENT_FULL_PORT}/ 2>/dev/null || echo 000"
             )
+            code_out, _, _ = self._exec(client, curl_cmd, timeout=8)
             try:
                 hc = int(code_out.strip()[:3])
             except ValueError:
                 hc = 0
             return 200 <= hc < 400, None, None
 
-        health_out, _, _ = self._exec(
-            client,
-            f"curl -sf --max-time 3 http://localhost:{AGENT_PORT}/health 2>/dev/null || echo FAIL",
-            timeout=8,
+        health_cmd = (
+            f"curl -sf --max-time 3 http://localhost:{AGENT_PORT}/health 2>nul || echo FAIL"
+            if is_windows else
+            f"curl -sf --max-time 3 http://localhost:{AGENT_PORT}/health 2>/dev/null || echo FAIL"
         )
+        health_out, _, _ = self._exec(client, health_cmd, timeout=8)
         health = '"status":"ok"' in health_out
         uptime, running_tasks = None, None
         if health:
@@ -745,7 +828,7 @@ class AgentDeployManager:
             sidecar_ok = False
             if FP_SIDECAR_ENABLED:
                 self._step(step_cb, '部署TLS指纹sidecar...')
-                remote_dir = AGENT_FULL_REMOTE_DIR if mode == 'full' else AGENT_REMOTE_DIR
+                remote_dir = self._resolve_remote_dir(client, mode)
                 if self._deploy_fp_sidecar(client, host, remote_dir, source_root):
                     self._pm2_start_sidecar(client, host, remote_dir)
                     self._step(step_cb, 'sidecar健康检查...')
@@ -1252,22 +1335,24 @@ class AgentDeployManager:
         给 node 进程注入 FP_SIDECAR_ADDR，使 connectionChannel/account 经 sidecar 施加 TLS 指纹。
         sidecar 没起来时绝不注入——否则 agent 会连一个不存在的 sidecar 导致请求全失败。
         """
+        is_windows = self._detect_os(client) == 'windows'
+
         if mode == 'full':
             pm2_name = AGENT_FULL_PM2_NAME
-            remote_dir = AGENT_FULL_REMOTE_DIR
             entry_script = 'web/server.js'
         else:
             pm2_name = AGENT_PM2_NAME
-            remote_dir = AGENT_REMOTE_DIR
             entry_script = 'agent/server.js'
+        remote_dir = self._resolve_remote_dir(client, mode)
 
         env_prefix = f"FP_SIDECAR_ADDR={FP_SIDECAR_ADDR} " if inject_fp_env else ""
 
-        out, _, code = self._exec(
-            client,
-            f"pm2 jlist 2>/dev/null | grep -q '\"name\":\"{pm2_name}\"' && echo EXISTS || echo NOTEXIST",
-            timeout=30,
+        detect_cmd = (
+            f"pm2 jlist 2>nul | findstr \"{pm2_name}\" >nul && echo EXISTS || echo NOTEXIST"
+            if is_windows else
+            f"pm2 jlist 2>/dev/null | grep -q '\"name\":\"{pm2_name}\"' && echo EXISTS || echo NOTEXIST"
         )
+        out, _, code = self._exec(client, detect_cmd, timeout=30)
         if 'EXISTS' in out:
             self._log(f"[{host}] PM2 重启 {pm2_name}...", 'INFO')
             # --update-env 让 restart 重新读取上面注入的环境变量
