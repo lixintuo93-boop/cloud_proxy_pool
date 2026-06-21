@@ -873,28 +873,45 @@ class AgentDeployManager:
                 self._deploying_ids.discard(server_id)
 
     def _write_deploy_status(self, server, status, mode=None):
-        """部署完成后把结果写回 ssh_servers.last_deploy_status + deploy_mode"""
+        """部署完成后把结果写回 ssh_servers。
+
+        status='success' + mode → 追加 mode 到 deploy_mode（逗号分隔去重）
+        status='failed'         → 只写 status，不动 deploy_mode
+        """
         try:
             from database import ProxyDatabase
             db = ProxyDatabase()
             db.update_server_deploy_status(server['id'], status)
-            if mode:
-                db.update_server_deploy_mode(server['id'], mode)
+            if mode and status == 'success':
+                current = (server.get('deploy_mode') or 'agent').strip()
+                modes = set(m.strip() for m in current.split(',') if m.strip())
+                modes.add(mode)
+                new_mode = ','.join(sorted(modes))
+                db.update_server_deploy_mode(server['id'], new_mode)
+                server['deploy_mode'] = new_mode  # 同步内存
         except Exception as e:
             self._log(f"[{server.get('server_host','?')}] 状态写回失败: {e}", 'WARNING')
 
+    @staticmethod
+    def _get_modes(server):
+        """解析 deploy_mode 为 mode 列表，默认 ['agent']"""
+        raw = (server.get('deploy_mode') or 'agent').strip()
+        return [m.strip() for m in raw.split(',') if m.strip()]
+
     def start_server(self, server, step_cb=None):
         host = server['server_host']
-        mode = server.get('deploy_mode', 'agent')
+        modes = self._get_modes(server)
         client = None
         try:
             self._step(step_cb, '连接SSH...')
             client = self._connect(server)
-            self._step(step_cb, f'启动服务 (mode={mode})...')
-            self._pm2_start_or_restart(client, host, mode=mode)
+            for mode in modes:
+                self._step(step_cb, f'启动 {mode}...')
+                self._pm2_start_or_restart(client, host, mode=mode)
+                time.sleep(1)
             self._step(step_cb, '健康检查...')
             time.sleep(1)
-            health, uptime, running_tasks = self._health_check(client, mode=mode)
+            health, uptime, running_tasks = self._health_check(client, mode=modes[0])
             status = {'pm2': 'online' if health else 'started', 'health': health,
                       'uptime': uptime, 'running_tasks': running_tasks}
             return {'ok': True, 'msg': 'started', 'status': status}
@@ -910,25 +927,26 @@ class AgentDeployManager:
 
     def stop_server(self, server, step_cb=None):
         host = server['server_host']
-        mode = server.get('deploy_mode', 'agent')
-        port = AGENT_FULL_PORT if mode == 'full' else AGENT_PORT
-        pm2_name = AGENT_FULL_PM2_NAME if mode == 'full' else AGENT_PM2_NAME
+        modes = self._get_modes(server)
         client = None
         try:
             self._step(step_cb, '连接SSH...')
             client = self._connect(server)
             is_windows = self._detect_os(client) == 'windows'
-            if is_windows:
-                self._step(step_cb, f'停止 node (端口 {port})...')
-                # 按端口杀进程（只杀当前模式的，不影响其他 node 进程）
-                self._exec(client,
-                    f"for /f \"tokens=5\" %p in ('netstat -ano 2^>nul ^| findstr :{port} ^| findstr LISTENING') do @taskkill /f /pid %p >nul 2>&1",
-                    timeout=15)
-                self._log(f"[{host}] 已停止端口 {port} 的进程", 'INFO')
-            else:
-                self._step(step_cb, f'停止PM2 ({pm2_name})...')
-                out, _, _ = self._exec(client, f"pm2 stop {pm2_name} 2>&1 || true", timeout=30)
-                self._log(f"[{host}] 停止: {out[:100]}", 'INFO')
+            for mode in modes:
+                port = AGENT_FULL_PORT if mode == 'full' else AGENT_PORT
+                pm2_name = AGENT_FULL_PM2_NAME if mode == 'full' else AGENT_PM2_NAME
+                if is_windows:
+                    self._step(step_cb, f'停止 {mode} (端口 {port})...')
+                    self._exec(client,
+                        f"for /f \"tokens=5\" %p in ('netstat -ano 2^>nul ^| findstr :{port} ^| findstr LISTENING') do @taskkill /f /pid %p >nul 2>&1",
+                        timeout=15)
+                    self._log(f"[{host}] 已停止端口 {port} ({mode})", 'INFO')
+                else:
+                    self._step(step_cb, f'停止PM2 ({pm2_name})...')
+                    out, _, _ = self._exec(client, f"pm2 stop {pm2_name} 2>&1 || true", timeout=30)
+                    self._log(f"[{host}] 停止 {pm2_name}: {out[:100]}", 'INFO')
+                time.sleep(0.5)
             status = {'pm2': 'stopped', 'health': False, 'uptime': None, 'running_tasks': None}
             return {'ok': True, 'msg': 'stopped', 'status': status}
         except Exception as e:
@@ -943,24 +961,26 @@ class AgentDeployManager:
 
     def restart_server(self, server, step_cb=None):
         host = server['server_host']
-        mode = server.get('deploy_mode', 'agent')
-        port = AGENT_FULL_PORT if mode == 'full' else AGENT_PORT
+        modes = self._get_modes(server)
         client = None
         try:
             self._step(step_cb, '连接SSH...')
             client = self._connect(server)
             is_windows = self._detect_os(client) == 'windows'
-            if is_windows:
-                self._step(step_cb, f'停止旧进程 (端口 {port})...')
-                self._exec(client,
-                    f"for /f \"tokens=5\" %p in ('netstat -ano 2^>nul ^| findstr :{port} ^| findstr LISTENING') do @taskkill /f /pid %p >nul 2>&1",
-                    timeout=15)
-                time.sleep(1)
-            self._step(step_cb, f'重启服务 (mode={mode})...')
-            self._pm2_start_or_restart(client, host, mode=mode)
+            for mode in modes:
+                port = AGENT_FULL_PORT if mode == 'full' else AGENT_PORT
+                if is_windows:
+                    self._step(step_cb, f'停止旧进程 {mode} (端口 {port})...')
+                    self._exec(client,
+                        f"for /f \"tokens=5\" %p in ('netstat -ano 2^>nul ^| findstr :{port} ^| findstr LISTENING') do @taskkill /f /pid %p >nul 2>&1",
+                        timeout=15)
+                    time.sleep(1)
+                self._step(step_cb, f'重启 {mode}...')
+                self._pm2_start_or_restart(client, host, mode=mode)
+                time.sleep(0.5)
             self._step(step_cb, '健康检查...')
             time.sleep(1)
-            health, uptime, running_tasks = self._health_check(client, mode=mode)
+            health, uptime, running_tasks = self._health_check(client, mode=modes[0])
             status = {'pm2': 'online' if health else 'restarted', 'health': health,
                       'uptime': uptime, 'running_tasks': running_tasks}
             return {'ok': True, 'msg': 'restarted', 'status': status}
@@ -975,85 +995,70 @@ class AgentDeployManager:
                     pass
 
     def get_server_status(self, server):
-        """
-        返回 {
-            'pm2': 'online'|'stopped'|'not_found'|'error',
-            'health': True|False,
-            'uptime': int|None,
-            'running_tasks': int|None,
-        }
-        """
+        """返回 pm2/health/uptime/running_tasks，多 mode 时合并（任一 online/healthy 即算）。"""
         host = server['server_host']
-        mode = server.get('deploy_mode', 'agent')
-        port = AGENT_FULL_PORT if mode == 'full' else AGENT_PORT
-        pm2_name = AGENT_FULL_PM2_NAME if mode == 'full' else AGENT_PM2_NAME
+        modes = self._get_modes(server)
         client = None
         try:
             client = self._connect(server, timeout=8)
             is_windows = self._detect_os(client) == 'windows'
-
-            if is_windows:
-                # Windows: 用 netstat 检测端口是否监听
-                out, _, code = self._exec(
-                    client,
-                    f"netstat -ano 2>nul | findstr :{port} | findstr LISTENING >nul && echo online || echo stopped",
-                    timeout=15,
-                )
-                pm2_status = 'online' if 'online' in out else 'stopped'
-                # 健康检查用 PowerShell
-                health_cmd = (
-                    f"powershell -Command \"try {{ "
-                    f"$r=Invoke-WebRequest -Uri 'http://localhost:{port}/health' "
-                    f"-UseBasicParsing -TimeoutSec 3; Write-Host $r.Content "
-                    f"}} catch {{ Write-Host 'FAIL' }}\""
-                )
-            else:
-                # PM2 状态
-                out, _, code = self._exec(
-                    client,
-                    f"pm2 show {pm2_name} 2>/dev/null | grep -E 'status|uptime' || echo NOT_FOUND",
-                    timeout=30,
-                )
-                if 'NOT_FOUND' in out or code != 0:
-                    pm2_status = 'not_found'
-                elif 'online' in out.lower():
-                    pm2_status = 'online'
-                elif 'stopped' in out.lower() or 'errored' in out.lower():
-                    pm2_status = 'stopped'
+            merged_pm2 = 'not_found'
+            merged_health = False
+            merged_uptime = None
+            merged_tasks = None
+            for mode in modes:
+                port = AGENT_FULL_PORT if mode == 'full' else AGENT_PORT
+                pm2_name = AGENT_FULL_PM2_NAME if mode == 'full' else AGENT_PM2_NAME
+                if is_windows:
+                    out, _, code = self._exec(client,
+                        f"netstat -ano 2>nul | findstr :{port} | findstr LISTENING >nul && echo online || echo stopped",
+                        timeout=15)
+                    pm2_status = 'online' if 'online' in out else 'stopped'
+                    health_cmd = (
+                        f"powershell -Command \"try {{ "
+                        f"$r=Invoke-WebRequest -Uri 'http://localhost:{port}/health' "
+                        f"-UseBasicParsing -TimeoutSec 3; Write-Host $r.Content "
+                        f"}} catch {{ Write-Host 'FAIL' }}\""
+                    )
                 else:
-                    pm2_status = 'unknown'
-                # HTTP 健康检查
-                health_cmd = f"curl -sf --max-time 3 http://localhost:{port}/health 2>/dev/null || echo FAIL"
-
-            health_out, _, _ = self._exec(client, health_cmd, timeout=8)
-            health = '"status":"ok"' in health_out
-
-            running_tasks = None
-            uptime_sec = None
-            if health:
-                import json
-                try:
-                    data = json.loads(health_out)
-                    running_tasks = data.get('runningTasks')
-                    uptime_sec = data.get('uptime')
-                except Exception:
-                    pass
-
-            return {
-                'pm2': pm2_status,
-                'health': health,
-                'uptime': uptime_sec,
-                'running_tasks': running_tasks,
-            }
-        except Exception as e:
-            return {'pm2': 'error', 'health': False, 'uptime': None, 'running_tasks': None, 'error': str(e)}
+                    out, _, code = self._exec(client,
+                        f"pm2 show {pm2_name} 2>/dev/null | grep -E 'status|uptime' || echo NOT_FOUND",
+                        timeout=30)
+                    if 'NOT_FOUND' in out or code != 0:
+                        pm2_status = 'not_found'
+                    elif 'online' in out.lower():
+                        pm2_status = 'online'
+                    elif 'stopped' in out.lower() or 'errored' in out.lower():
+                        pm2_status = 'stopped'
+                    else:
+                        pm2_status = 'unknown'
+                    health_cmd = f"curl -sf --max-time 3 http://localhost:{port}/health 2>/dev/null || echo FAIL"
+                health_out, _, _ = self._exec(client, health_cmd, timeout=8)
+                health = '"status":"ok"' in health_out
+                if pm2_status == 'online':
+                    merged_pm2 = 'online'
+                elif merged_pm2 == 'not_found' and pm2_status not in ('not_found', 'unknown'):
+                    merged_pm2 = pm2_status
+                if health:
+                    merged_health = True
+                    import json
+                    try:
+                        data = json.loads(health_out)
+                        if merged_tasks is None:
+                            merged_tasks = data.get('runningTasks')
+                        if merged_uptime is None:
+                            merged_uptime = data.get('uptime')
+                    except Exception:
+                        pass
+            return {'pm2': merged_pm2, 'health': merged_health, 'uptime': merged_uptime, 'running_tasks': merged_tasks}
+        except Exception:
+            return {'pm2': 'error', 'health': False, 'uptime': None, 'running_tasks': None}
         finally:
             if client:
                 try:
                     client.close()
                 except Exception:
                     pass
-
     def get_server_logs(self, server, lines=100):
         """获取 PM2 日志最后 N 行，返回字符串"""
         host = server['server_host']

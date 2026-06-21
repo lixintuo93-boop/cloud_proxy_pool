@@ -2462,6 +2462,15 @@ class ProxyManagerGUI:
     _DEPLOY_LABEL   = {'never': '未部署', 'success': '✅ 成功', 'failed': '❌ 失败'}
     _MODE_LABEL     = {'agent': '🔹 Agent', 'full': '🔶 完整'}
 
+    @staticmethod
+    def _format_deploy_mode(raw_mode):
+        """把 'agent,full' 格式化为显示文本 '🔹 Agent + 🔶 完整'"""
+        if not raw_mode:
+            return '🔹 Agent'
+        modes = [m.strip() for m in raw_mode.split(',') if m.strip()]
+        labels = [AgentTab._MODE_LABEL.get(m, m) for m in modes]
+        return ' + '.join(labels)
+
     def _agent_load_servers(self):
         """从 DB 加载服务器列表到 Treeview（不查询状态，只填 IP/端口/平台/部署状态）"""
         if not self.agent_manager:
@@ -2474,7 +2483,7 @@ class ProxyManagerGUI:
         for s in servers:
             platform = self._PLATFORM_LABEL.get(s.get('cloud_provider') or 'auto', '未探测')
             deploy   = self._DEPLOY_LABEL.get(s.get('last_deploy_status') or 'never', '未部署')
-            dmode    = self._MODE_LABEL.get(s.get('deploy_mode') or 'agent', '🔹 Agent')
+            dmode    = self._format_deploy_mode(s.get('deploy_mode') or 'agent')
             self.agent_tree.insert('', tk.END, iid=str(s['id']), values=(
                 '', s['id'], s['name'], s['server_host'], s['server_port'],
                 platform, deploy, dmode,
