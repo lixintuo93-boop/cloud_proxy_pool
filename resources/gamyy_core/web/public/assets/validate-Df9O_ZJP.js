@@ -1,0 +1,1 @@
+const n=/^([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d{1,3})?$/,r=/^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}(:\d{2})?)?$/;function i(t){return t?n.test(t):!0}function u(t){return t?r.test(t):!0}function s(t){if(t===""||t==="auto")return!0;const e=Number(t);return Number.isInteger(e)&&e>0}export{s as a,u as b,i};

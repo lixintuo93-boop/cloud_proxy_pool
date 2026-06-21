@@ -1,0 +1,1284 @@
+# managers/agent_deploy_manager.py
+"""
+Gamyy Agent 部署管理器
+- 并发部署/启动/停止/重启 gamyy-agent 到 ssh_servers 中的云服务器
+- 智能跳过已安装的 Node.js / PM2 / 编译工具链（避免重复耗时操作）
+- 支持下载云端 SQLite 日志数据库到本地
+"""
+import os
+import io
+import random
+import sqlite3
+import threading
+import time
+import socket
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+# SSH 握手阶段（DH密钥交换 + 密码认证）是 CPU 密集操作。
+# 该信号量限制同时进行握手的并发数，防止 1000 个 worker 瞬时全发导致本地 CPU 打满。
+# 握手完成后信号量立即释放，后续 npm install 等 I/O 等待不受影响。
+_SSH_CONNECT_CONCURRENCY = 50
+
+# 镜像表（暂保留结构，所有云厂商都退回官方源——cloud_provider 字段仅用于显示标签）
+# 历史上这里有阿里云/腾讯云镜像，因兼容性问题（路径差异、GPG key 不同步、codename 异常）已下线。
+# 如果将来再要启用，给对应键填 URL 即可，下方 _ensure_nodejs/_ensure_pm2/_npm_install_project 会自动用上。
+_MIRRORS = {
+    'aliyun':  {'npm': None, 'nodesource_apt': None, 'nodesource_rpm': None, 'gpg_key': None},
+    'tencent': {'npm': None, 'nodesource_apt': None, 'nodesource_rpm': None, 'gpg_key': None},
+    'default': {'npm': None, 'nodesource_apt': None, 'nodesource_rpm': None, 'gpg_key': None},
+}
+
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import fnmatch
+import paramiko
+from config import (
+    DATABASE_FILE, AGENT_SOURCE_DIR, AGENT_REMOTE_DIR, AGENT_PORT,
+    AGENT_PM2_NAME, AGENT_UPLOAD_DIRS, AGENT_PACKAGE_FILE,
+    AGENT_DEPLOY_WORKERS, AGENT_OP_WORKERS,
+    AGENT_REMOTE_DB, AGENT_LOG_SAVE_DIR,
+    AGENT_FULL_REMOTE_DIR, AGENT_FULL_PM2_NAME, AGENT_FULL_PORT,
+    RESOURCE_DIR_NAME,
+    FP_SIDECAR_ENABLED, FP_SIDECAR_ADDR, FP_SIDECAR_PM2_NAME,
+    FP_SIDECAR_BINARY_REL, FP_SIDECAR_BINARY, FP_SIDECAR_REMOTE_SUBDIR, FP_SIDECAR_PROBE_TARGET,
+    _app_root, _resource_root,
+    get_beijing_time_str,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 部署源解析（imported > synced > bundled > external）
+# ──────────────────────────────────────────────────────────────────────
+def _is_valid_source(path):
+    """判断目录里是否有 agent/server.js，作为"合法 gamyy-core 源"的最简指标。"""
+    if not path or not os.path.isdir(path):
+        return False
+    return os.path.isfile(os.path.join(path, 'agent', 'server.js'))
+
+
+def get_deploy_source():
+    """
+    解析部署源目录，按优先级返回 (path, kind)。
+    kind in: 'imported' / 'synced' / 'bundled' / 'external' / 'missing'
+
+    1. _app_root()/imported_source/                  ← "📤 导入 zip"写入处（运行时覆盖）
+    2. _app_root()/resources/<RESOURCE_DIR_NAME>/     ← "📥 同步"写入处（dev 时在项目里；EXE 时在 EXE 同目录）
+    3. _resource_root()/resources/<RESOURCE_DIR_NAME>/← PyInstaller --add-data 打进 EXE 的内置版（仅 EXE 模式有意义）
+    4. AGENT_SOURCE_DIR                                ← GUI 外部目录 fallback
+    """
+    candidates = [
+        (os.path.join(_app_root(), 'imported_source'), 'imported'),
+        (os.path.join(_app_root(), 'resources', RESOURCE_DIR_NAME), 'synced'),
+    ]
+    bundled = os.path.join(_resource_root(), 'resources', RESOURCE_DIR_NAME)
+    if bundled != candidates[1][0]:
+        candidates.append((bundled, 'bundled'))
+    if AGENT_SOURCE_DIR:
+        candidates.append((AGENT_SOURCE_DIR, 'external'))
+
+    for p, k in candidates:
+        if _is_valid_source(p):
+            return p, k
+    return None, 'missing'
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 完整模式上传排除规则
+# ──────────────────────────────────────────────────────────────────────
+# 子目录名（在任意层级出现则跳过整棵子树）
+_FULL_EXCLUDE_DIRS = {
+    'node_modules', '.git', '.idea', '.vscode', '__pycache__',
+    'fp-sidecar',  # sidecar 源码/二进制不随整树上传；Linux 二进制由 _deploy_fp_sidecar 显式上传
+}
+# 文件名 fnmatch 模式
+_FULL_EXCLUDE_PATTERNS = [
+    '*.pcapng', '*.7z', '*.zip', '*.pyc', '*.exe',
+    'pm2日志.txt', '微信端登录返回结果.txt',
+    'config.db-wal', 'config.db-shm',
+]
+# 相对源根的特定路径（精确匹配）
+_FULL_EXCLUDE_SPECIFIC = {
+    os.path.join('data', 'ticket_checker.db'),     # 远端运行时生成
+}
+
+
+def _should_skip_full(rel_path, is_dir):
+    """完整模式 sftp 上传/sync 时的过滤器。
+    rel_path: 相对源根的相对路径
+    is_dir: 是否为目录
+    """
+    rel_path = os.path.normpath(rel_path)
+    name = os.path.basename(rel_path) or rel_path
+    if is_dir and name in _FULL_EXCLUDE_DIRS:
+        return True
+    if name.startswith('.'):
+        return True  # 任何点开头隐藏项
+    if not is_dir:
+        for pat in _FULL_EXCLUDE_PATTERNS:
+            if fnmatch.fnmatch(name, pat):
+                return True
+    if rel_path in _FULL_EXCLUDE_SPECIFIC:
+        return True
+    return False
+
+
+class AgentDeployManager:
+    def __init__(self, db_file=None, log_callback=None):
+        self.db_file = db_file or DATABASE_FILE
+        self.log_cb = log_callback  # callback(msg, level='INFO'|'SUCCESS'|'ERROR'|'WARNING')
+        self._lock = threading.Lock()
+        self._connect_sem = threading.Semaphore(_SSH_CONNECT_CONCURRENCY)
+        # 正在部署中的 server_id 集合（per-server 锁）
+        # 进入 deploy_server 时 add；finally remove。同台再被发起部署直接返回"已在部署中"
+        # 防止同一台服务器被两批部署任务并发撞 SSH/SFTP/npm 导致状态损坏
+        self._deploying_ids = set()
+        self._deploying_lock = threading.Lock()
+
+    # ──────────────────────────────────────────────────────────
+    # 日志
+    # ──────────────────────────────────────────────────────────
+    def _log(self, msg, level='INFO'):
+        ts = get_beijing_time_str('%H:%M:%S')
+        line = f"[{ts}] {msg}"
+        if self.log_cb:
+            try:
+                self.log_cb(line, level)
+            except Exception:
+                pass
+
+    # ──────────────────────────────────────────────────────────
+    # 数据库访问
+    # ──────────────────────────────────────────────────────────
+    def get_all_servers(self):
+        """返回 ssh_servers 所有记录 list[dict]"""
+        conn = sqlite3.connect(self.db_file)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute('SELECT id, name, server_host, server_port, username, password, cloud_provider, last_deploy_status FROM ssh_servers ORDER BY id')
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
+
+    def get_server(self, server_id):
+        conn = sqlite3.connect(self.db_file)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute('SELECT id, name, server_host, server_port, username, password, cloud_provider, last_deploy_status FROM ssh_servers WHERE id=?', (server_id,))
+        row = cur.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def get_servers_by_ids(self, server_ids):
+        """批量获取服务器信息，一次 SQL 替代 N 次单查，保持传入顺序。
+        SELECT 字段与 get_all_servers / get_server 对齐，含 last_deploy_status，
+        否则 _classify_for_deploy 会把所有服务器都当成 'never'。
+        """
+        if not server_ids:
+            return []
+        conn = sqlite3.connect(self.db_file)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        placeholders = ','.join('?' * len(server_ids))
+        cur.execute(
+            f'SELECT id, name, server_host, server_port, username, password, '
+            f'cloud_provider, last_deploy_status '
+            f'FROM ssh_servers WHERE id IN ({placeholders})',
+            list(server_ids)
+        )
+        rows = {r['id']: dict(r) for r in cur.fetchall()}
+        conn.close()
+        return [rows[sid] for sid in server_ids if sid in rows]
+
+    # ──────────────────────────────────────────────────────────
+    # SSH 工具
+    # ──────────────────────────────────────────────────────────
+    # SSH 建连重试参数（针对云厂商 SYN 限流 / 临时网络抖动 / 服务端 sshd 慢响应）
+    # AuthenticationException 不重试（密码就是错的，重试无意义）
+    _SSH_CONNECT_MAX_ATTEMPTS = 4              # 总尝试次数（含首次）
+    _SSH_CONNECT_BACKOFFS = [3, 8, 15]         # 第 1..3 次重试前等待基数（秒）+ 0~50% 抖动
+
+    def _connect(self, server, timeout=15):
+        """
+        建立 paramiko SSH 连接。
+        握手阶段（DH密钥交换 + 认证）用 _connect_sem 限速，
+        防止 1000 个 worker 同时握手把本地 CPU 打满。
+        握手完成后信号量立即释放，不影响后续命令执行。
+
+        失败重试策略：最多 4 次尝试，间隔 3/8/15s + 0~50% 抖动。
+        - 认证失败（AuthenticationException）直接抛，不重试
+        - 其他（socket.timeout / paramiko.SSHException / 各种网络异常）计入重试
+        - 每次尝试都重新进 semaphore，让出名额给其他 worker，不会卡占名额
+        """
+        host = server['server_host']
+        max_attempts = self._SSH_CONNECT_MAX_ATTEMPTS
+        last_exc = None
+
+        for attempt in range(1, max_attempts + 1):
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            try:
+                with self._connect_sem:
+                    client.connect(
+                        hostname=host,
+                        port=server['server_port'],
+                        username=server['username'],
+                        password=server['password'],
+                        timeout=timeout,
+                        allow_agent=False,
+                        look_for_keys=False,
+                        banner_timeout=20,
+                        auth_timeout=20,
+                    )
+                return client
+            except paramiko.AuthenticationException:
+                # 密码错就是错，重试没用
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                raise
+            except Exception as e:
+                last_exc = e
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                if attempt < max_attempts:
+                    base = self._SSH_CONNECT_BACKOFFS[attempt - 1]
+                    wait = base + random.uniform(0, base * 0.5)
+                    self._log(
+                        f"[{host}] SSH 建连失败 ({type(e).__name__}: {str(e)[:80]})，"
+                        f"{wait:.1f}s 后重试 ({attempt+1}/{max_attempts})...",
+                        'WARNING',
+                    )
+                    time.sleep(wait)
+
+        # 所有尝试用完，抛最后一次的异常
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"[{host}] SSH 建连失败：未知原因")
+
+    def _exec(self, client, cmd, timeout=120):
+        """
+        执行命令，返回 (stdout_str, stderr_str, exit_code)。
+        使用轮询替代 recv_exit_status() 的无限阻塞，
+        确保命令超时时线程能正常退出而不是永久挂起。
+        """
+        stdin, stdout, stderr = client.exec_command(cmd)
+        channel = stdout.channel
+        deadline = time.monotonic() + timeout
+        while not channel.exit_status_ready():
+            if time.monotonic() > deadline:
+                channel.close()
+                raise TimeoutError(f"命令超时({timeout}s): {cmd[:80]}")
+            time.sleep(0.5)
+        exit_code = channel.recv_exit_status()
+        out = stdout.read().decode('utf-8', errors='replace').strip()
+        err = stderr.read().decode('utf-8', errors='replace').strip()
+        return out, err, exit_code
+
+    def _is_cmd_available(self, client, cmd):
+        """检查命令是否可用（exit 0）"""
+        _, _, code = self._exec(client, f"command -v {cmd} >/dev/null 2>&1", timeout=10)
+        return code == 0
+
+    def _get_cmd_version(self, client, cmd):
+        """获取命令版本号字符串，不可用返回 None"""
+        out, _, code = self._exec(client, f"{cmd} --version 2>/dev/null || {cmd} -v 2>/dev/null", timeout=10)
+        return out.strip() if code == 0 and out.strip() else None
+
+    # ──────────────────────────────────────────────────────────
+    # SFTP 上传
+    # ──────────────────────────────────────────────────────────
+    def _sftp_mkdir_p(self, sftp, remote_path):
+        """递归创建远端目录"""
+        parts = remote_path.rstrip('/').split('/')
+        current = ''
+        for part in parts:
+            if not part:
+                current = '/'
+                continue
+            current = current.rstrip('/') + '/' + part
+            try:
+                sftp.stat(current)
+            except FileNotFoundError:
+                sftp.mkdir(current)
+
+    def _sftp_upload_dir(self, sftp, local_dir, remote_dir, log_prefix=''):
+        """递归上传本地目录到远端"""
+        self._sftp_mkdir_p(sftp, remote_dir)
+        for item in os.listdir(local_dir):
+            if item == 'node_modules' or item.startswith('.'):
+                continue
+            local_path = os.path.join(local_dir, item)
+            remote_path = remote_dir.rstrip('/') + '/' + item
+            if os.path.isdir(local_path):
+                self._sftp_upload_dir(sftp, local_path, remote_path, log_prefix)
+            else:
+                sftp.put(local_path, remote_path)
+
+    def _sftp_upload_full_dir(self, sftp, local_dir, remote_dir, source_root):
+        """完整模式专用：按 _should_skip_full 过滤递归上传。
+        source_root 用于算 rel_path（fnmatch 用），同时供 specific 路径精确匹配。
+        """
+        self._sftp_mkdir_p(sftp, remote_dir)
+        for item in os.listdir(local_dir):
+            local_path = os.path.join(local_dir, item)
+            rel = os.path.relpath(local_path, source_root)
+            is_dir = os.path.isdir(local_path)
+            if _should_skip_full(rel, is_dir):
+                continue
+            remote_path = remote_dir.rstrip('/') + '/' + item
+            if is_dir:
+                self._sftp_upload_full_dir(sftp, local_path, remote_path, source_root)
+            else:
+                sftp.put(local_path, remote_path)
+
+    def _upload_agent_files(self, client, server_host, source_root=None, mode='agent'):
+        """通过 SFTP 上传文件。
+        source_root: 部署源根目录（由 get_deploy_source 解析）；None 时回退到 AGENT_SOURCE_DIR
+        mode='agent': 精简模式，仅上传 AGENT_UPLOAD_DIRS + package-agent.json→package.json
+        mode='full' : 完整模式，递归上传整个 source_root（按 _should_skip_full 排除）+ 完整 package.json
+        """
+        src = source_root or AGENT_SOURCE_DIR
+        remote_dir = AGENT_FULL_REMOTE_DIR if mode == 'full' else AGENT_REMOTE_DIR
+
+        # 非 root 用户（如腾讯云 ubuntu）无法直接写 /opt/，先用 sudo 建目录并授权
+        self._exec(
+            client,
+            f"sudo mkdir -p {remote_dir}/data && "
+            f"sudo chown -R $(whoami):$(whoami) {remote_dir}",
+            timeout=30
+        )
+        sftp = client.open_sftp()
+        try:
+            self._sftp_mkdir_p(sftp, remote_dir)
+
+            if mode == 'full':
+                # 完整模式：递归整个源根
+                self._sftp_upload_full_dir(sftp, src, remote_dir, src)
+                # package.json 在 source_root 顶层，已被上面的递归上传带上去（除非被排除规则误命中）
+                # 保险起见检测一下
+                if not os.path.isfile(os.path.join(src, 'package.json')):
+                    self._log(f"[{server_host}] 警告：source 根缺 package.json", 'WARNING')
+            else:
+                # 精简 Agent 模式：保持原逻辑
+                self._sftp_mkdir_p(sftp, remote_dir + '/data')
+                for d in AGENT_UPLOAD_DIRS:
+                    local_d = os.path.join(src, d)
+                    if not os.path.isdir(local_d):
+                        self._log(f"[{server_host}] 警告：本地目录不存在 {local_d}", 'WARNING')
+                        continue
+                    remote_d = remote_dir + '/' + d
+                    self._sftp_upload_dir(sftp, local_d, remote_d)
+
+                # 上传 package-agent.json → package.json
+                pkg_local = os.path.join(src, AGENT_PACKAGE_FILE)
+                if os.path.isfile(pkg_local):
+                    sftp.put(pkg_local, remote_dir + '/package.json')
+                else:
+                    self._log(f"[{server_host}] 警告：找不到 {pkg_local}", 'WARNING')
+        finally:
+            sftp.close()
+
+    # ──────────────────────────────────────────────────────────
+    # 环境检测与安装（跳过已安装）
+    # ──────────────────────────────────────────────────────────
+    # Node.js 安装重试参数
+    _NODEJS_MAX_ATTEMPTS = 8              # 总尝试次数（含首次）
+    _NODEJS_SINGLE_TIMEOUT = 90           # 单次超时（秒）—— 短超时早放弃换轮次
+    _NODEJS_BACKOFFS = [3, 8, 15, 25, 40, 60, 90]  # 第 1..7 次重试前的等待基数（秒）
+
+    # PM2 全局安装重试参数
+    _PM2_MAX_ATTEMPTS = 7
+    _PM2_SINGLE_TIMEOUT = 60
+    _PM2_BACKOFFS = [3, 8, 15, 25, 40, 60]
+
+    # 项目 npm install 重试参数（含原生模块编译）
+    _NPM_MAX_ATTEMPTS = 7
+    _NPM_SINGLE_TIMEOUT = 240
+    _NPM_BACKOFFS = [5, 15, 30, 60, 90, 120]
+
+    def _npm_registry_arg(self, cloud):
+        """返回 npm 命令的 --registry= 参数（含等号），无镜像时返回空串"""
+        url = _MIRRORS.get(cloud, _MIRRORS['default'])['npm']
+        return f"--registry={url} " if url else ""
+
+    def _ensure_nodejs(self, client, server_host, cloud='default'):
+        """确保 Node.js >= 18，不满足则安装 Node.js 20。
+
+        失败重试策略：单次 90s，最多 8 次尝试，间隔 3/8/15/25/40/60/90s + 0~50% 抖动。
+        重试前清理 apt/yum 残留 lock 与进程，避免锁冲突连环失败。
+        超时与非零退出码都纳入重试。
+
+        cloud='aliyun' 时手工配置阿里云 nodesource apt 仓库；
+        其它（含 'tencent'/'default'）走官方 setup_20.x 脚本。
+        """
+        out, _, code = self._exec(client, "node -v 2>/dev/null || echo NOT_FOUND", timeout=10)
+        if code == 0 and out.startswith('v'):
+            major = int(out.lstrip('v').split('.')[0])
+            if major >= 18:
+                self._log(f"[{server_host}] Node.js {out} 已安装，跳过", 'INFO')
+                return True
+
+        # 全部走官方 setup_20.x 脚本（cloud 参数当前不再驱动镜像选择，仅作标签用途）
+        install_cmd = (
+            "if command -v apt-get &>/dev/null; then "
+            "  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash - && sudo apt-get install -y nodejs; "
+            "elif command -v yum &>/dev/null; then "
+            "  curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash - && sudo yum install -y nodejs; "
+            "fi"
+        )
+        # 重试前清理：杀残留 apt/yum 进程、删 lock 文件、修 dpkg 半截状态、
+        # 同时清掉上次失败留下的 nodesource.list 与可能为空的 GPG keyring，避免反复败在同一处
+        cleanup_cmd = (
+            "if command -v apt-get &>/dev/null; then "
+            "  sudo pkill -9 apt-get apt dpkg 2>/dev/null || true; "
+            "  sudo rm -f /var/lib/apt/lists/lock /var/lib/apt/lists/lock-frontend "
+            "    /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock 2>/dev/null || true; "
+            "  sudo rm -f /etc/apt/sources.list.d/nodesource.list /usr/share/keyrings/nodesource.gpg 2>/dev/null || true; "
+            "  sudo dpkg --configure -a 2>/dev/null || true; "
+            "elif command -v yum &>/dev/null; then "
+            "  sudo pkill -9 yum dnf 2>/dev/null || true; "
+            "  sudo rm -f /var/run/yum.pid /etc/yum.repos.d/nodesource.repo 2>/dev/null || true; "
+            "fi"
+        )
+
+        max_attempts = self._NODEJS_MAX_ATTEMPTS
+        last_reason = ''
+        for attempt in range(1, max_attempts + 1):
+            self._log(f"[{server_host}] 安装 Node.js 20 LTS（尝试 {attempt}/{max_attempts}）...", 'INFO')
+            try:
+                _, err, code = self._exec(client, install_cmd, timeout=self._NODEJS_SINGLE_TIMEOUT)
+                if code == 0:
+                    self._log(f"[{server_host}] Node.js 安装完成（尝试 {attempt}/{max_attempts}）", 'SUCCESS')
+                    return True
+                last_reason = f"非零退出码({code}): {(err or '')[:160]}"
+            except TimeoutError as e:
+                last_reason = f"超时({self._NODEJS_SINGLE_TIMEOUT}s)"
+
+            if attempt < max_attempts:
+                # 清理残留 lock，避免下次 apt 卡在锁上
+                try:
+                    self._exec(client, cleanup_cmd, timeout=15)
+                except Exception:
+                    pass
+                base = self._NODEJS_BACKOFFS[attempt - 1]
+                wait = base + random.uniform(0, base * 0.5)  # 抖动 0~50%
+                self._log(
+                    f"[{server_host}] Node.js 安装失败（{last_reason}），{wait:.1f}s 后重试 ({attempt+1}/{max_attempts})...",
+                    'WARNING',
+                )
+                time.sleep(wait)
+
+        raise RuntimeError(f"Node.js 安装失败（已尝试 {max_attempts} 次）：{last_reason}")
+
+    def _ensure_pm2(self, client, server_host, cloud='default'):
+        """确保 PM2 已安装。失败重试 7 次×60s，间隔 3/8/15/25/40/60s + 0~50% 抖动；按云走 npm 镜像。"""
+        out, _, code = self._exec(client, "pm2 -v 2>/dev/null || echo NOT_FOUND", timeout=10)
+        if code == 0 and out != 'NOT_FOUND' and out.strip():
+            self._log(f"[{server_host}] PM2 {out} 已安装，跳过", 'INFO')
+            return True
+
+        registry = self._npm_registry_arg(cloud)
+        install_cmd = f"sudo npm install -g {registry}pm2"
+
+        max_attempts = self._PM2_MAX_ATTEMPTS
+        last_reason = ''
+        for attempt in range(1, max_attempts + 1):
+            self._log(f"[{server_host}] 安装 PM2（尝试 {attempt}/{max_attempts}，cloud={cloud}）...", 'INFO')
+            try:
+                _, err, code = self._exec(client, install_cmd, timeout=self._PM2_SINGLE_TIMEOUT)
+                if code == 0:
+                    self._log(f"[{server_host}] PM2 安装完成（尝试 {attempt}/{max_attempts}）", 'SUCCESS')
+                    return True
+                last_reason = f"非零退出码({code}): {(err or '')[:160]}"
+            except TimeoutError:
+                last_reason = f"超时({self._PM2_SINGLE_TIMEOUT}s)"
+
+            if attempt < max_attempts:
+                base = self._PM2_BACKOFFS[attempt - 1]
+                wait = base + random.uniform(0, base * 0.5)
+                self._log(
+                    f"[{server_host}] PM2 安装失败（{last_reason}），{wait:.1f}s 后重试 ({attempt+1}/{max_attempts})...",
+                    'WARNING',
+                )
+                time.sleep(wait)
+
+        raise RuntimeError(f"PM2 安装失败（已尝试 {max_attempts} 次）：{last_reason}")
+
+    def _npm_install_project(self, client, server_host, cloud='default', mode='agent'):
+        """项目目录跑 npm install。失败重试 7 次×240s，间隔 5/15/30/60/90/120s + 0~50% 抖动；按云走 npm 镜像。
+
+        mode='agent': 在 AGENT_REMOTE_DIR 下用上传的精简 package.json 装
+        mode='full' : 在 AGENT_FULL_REMOTE_DIR 下用完整 package.json 装（含 express/better-sqlite3 等，编译耗时）
+        """
+        registry = self._npm_registry_arg(cloud)
+        remote_dir = AGENT_FULL_REMOTE_DIR if mode == 'full' else AGENT_REMOTE_DIR
+        npm_cmd = (
+            f"cd {remote_dir} && "
+            "rm -rf node_modules package-lock.json 2>/dev/null; "
+            "NODE_OPTIONS='--max-old-space-size=512' "
+            f"npm install {registry}--omit=dev --legacy-peer-deps 2>&1"
+        )
+
+        max_attempts = self._NPM_MAX_ATTEMPTS
+        last_reason = ''
+        for attempt in range(1, max_attempts + 1):
+            self._log(f"[{server_host}] npm install（尝试 {attempt}/{max_attempts}，cloud={cloud}）...", 'INFO')
+            try:
+                out, err, code = self._exec(client, npm_cmd, timeout=self._NPM_SINGLE_TIMEOUT)
+                if code == 0:
+                    self._log(f"[{server_host}] npm install 完成（尝试 {attempt}/{max_attempts}）", 'SUCCESS')
+                    return True
+                last_reason = f"非零退出码({code}): {(out + err)[:200]}"
+            except TimeoutError:
+                last_reason = f"超时({self._NPM_SINGLE_TIMEOUT}s)"
+
+            if attempt < max_attempts:
+                base = self._NPM_BACKOFFS[attempt - 1]
+                wait = base + random.uniform(0, base * 0.5)
+                self._log(
+                    f"[{server_host}] npm install 失败（{last_reason[:120]}），{wait:.1f}s 后重试 ({attempt+1}/{max_attempts})...",
+                    'WARNING',
+                )
+                time.sleep(wait)
+
+        raise RuntimeError(f"npm install 失败（已尝试 {max_attempts} 次）：{last_reason[:300]}")
+
+    def _ensure_build_tools(self, client, server_host):
+        """确保编译工具链已安装（sqlite3 原生模块需要）"""
+        # 检测 gcc 是否可用作为编译工具存在的代理指标
+        gcc_ok, _, _ = self._exec(client, "dpkg -l build-essential 2>/dev/null | grep -q '^ii' && echo OK || echo NO", timeout=10)
+        if gcc_ok.strip() == 'OK':
+            self._log(f"[{server_host}] 编译工具链已安装，跳过", 'INFO')
+        else:
+            self._log(f"[{server_host}] 安装编译工具链（build-essential + libsqlite3-dev）...", 'INFO')
+            cmd = (
+                "if command -v apt-get &>/dev/null; then "
+                "  sudo apt-get update -qq && sudo apt-get install -y -qq "
+                "  build-essential python3 python3-dev make gcc g++ libsqlite3-dev; "
+                "elif command -v yum &>/dev/null; then "
+                "  sudo yum groupinstall -y 'Development Tools' && sudo yum install -y python3 sqlite-devel; "
+                "fi && sudo ln -sf /usr/bin/python3 /usr/bin/python 2>/dev/null || true"
+            )
+            _, err, code = self._exec(client, cmd, timeout=300)
+            if code != 0:
+                self._log(f"[{server_host}] 编译工具安装警告（继续）: {err[:100]}", 'WARNING')
+
+        # node-gyp
+        gyp_out, _, _ = self._exec(client, "node-gyp -v 2>/dev/null || echo NOT_FOUND", timeout=10)
+        if 'NOT_FOUND' in gyp_out or not gyp_out.strip():
+            self._log(f"[{server_host}] 安装 node-gyp...", 'INFO')
+            self._exec(client, "sudo npm install -g node-gyp 2>/dev/null || true", timeout=60)
+
+    # ──────────────────────────────────────────────────────────
+    # 单台服务器操作
+    # ──────────────────────────────────────────────────────────
+    def _step(self, step_cb, msg):
+        """调用步骤回调（step_cb 可为 None）"""
+        if step_cb:
+            try:
+                step_cb(msg)
+            except Exception:
+                pass
+
+    # ──────────────────────────────────────────────────────────
+    # 云厂商探测（懒加载到 DB）
+    # ──────────────────────────────────────────────────────────
+    def _detect_cloud(self, client):
+        """通过 metadata API 探测云厂商，返回 'aliyun' / 'tencent' / 'default'。
+        阿里云: http://100.100.100.200/latest/meta-data/
+        腾讯云: http://metadata.tencentyun.com/latest/meta-data/
+        各 2s 超时，整体最多 ~5s。"""
+        # 阿里云
+        out, _, code = self._exec(
+            client,
+            "curl -m 2 -s -o /dev/null -w '%{http_code}' http://100.100.100.200/latest/meta-data/ 2>/dev/null",
+            timeout=5,
+        )
+        if code == 0 and out.strip() == '200':
+            return 'aliyun'
+        # 腾讯云
+        out, _, code = self._exec(
+            client,
+            "curl -m 2 -s -o /dev/null -w '%{http_code}' http://metadata.tencentyun.com/latest/meta-data/ 2>/dev/null",
+            timeout=5,
+        )
+        if code == 0 and out.strip() == '200':
+            return 'tencent'
+        return 'default'
+
+    def _resolve_cloud(self, server, client, host):
+        """获取该服务器的云厂商：'auto' 时探测并写回 DB；其它直接返回。"""
+        cp = (server.get('cloud_provider') or 'auto').strip().lower()
+        if cp not in ('auto', 'aliyun', 'tencent', 'default'):
+            cp = 'auto'
+        if cp != 'auto':
+            return cp
+        # 懒加载探测
+        try:
+            detected = self._detect_cloud(client)
+        except Exception as e:
+            self._log(f"[{host}] 云厂商探测异常（回落 default）: {e}", 'WARNING')
+            detected = 'default'
+        # 缓存到 DB（即使是 'default' 也写回，避免每次都探）
+        try:
+            from database import ProxyDatabase
+            ProxyDatabase().update_server_cloud_provider(server['id'], detected)
+        except Exception as e:
+            self._log(f"[{host}] 云厂商写回 DB 失败（已忽略）: {e}", 'WARNING')
+        self._log(f"[{host}] 云厂商探测结果: {detected}", 'INFO')
+        return detected
+
+    def _health_check(self, client, mode='agent'):
+        """执行 HTTP 健康检查，返回 (health:bool, uptime, running_tasks)
+
+        mode='agent': curl localhost:7070/health，解析 JSON 拿 uptime/runningTasks
+        mode='full' : curl localhost:3000/，只要返回 2xx/3xx 即算 OK；web/server.js 没有 /health
+                       端点，所以 uptime/runningTasks 返回 None
+        """
+        import json
+        if mode == 'full':
+            code_out, _, _ = self._exec(
+                client,
+                f"curl -s -o /dev/null --max-time 3 -w '%{{http_code}}' "
+                f"http://localhost:{AGENT_FULL_PORT}/ 2>/dev/null || echo 000",
+                timeout=8,
+            )
+            try:
+                hc = int(code_out.strip()[:3])
+            except ValueError:
+                hc = 0
+            return 200 <= hc < 400, None, None
+
+        health_out, _, _ = self._exec(
+            client,
+            f"curl -sf --max-time 3 http://localhost:{AGENT_PORT}/health 2>/dev/null || echo FAIL",
+            timeout=8,
+        )
+        health = '"status":"ok"' in health_out
+        uptime, running_tasks = None, None
+        if health:
+            try:
+                data = json.loads(health_out)
+                uptime = data.get('uptime')
+                running_tasks = data.get('runningTasks')
+            except Exception:
+                pass
+        return health, uptime, running_tasks
+
+    # ──────────────────────────────────────────────────────────
+    # 部署进行中状态查询（GUI 用，per-server 锁配套）
+    # ──────────────────────────────────────────────────────────
+    def get_deploying_ids(self):
+        """快照：当前正在部署中的 server_id 集合。GUI 分类用。"""
+        with self._deploying_lock:
+            return set(self._deploying_ids)
+
+    def get_pending_deploy_server_ids(self):
+        """返回 last_deploy_status ∈ {'never', 'failed', None, ''} 的所有 server_id。
+        GUI "🆕 选择待部署" 按钮用。
+        """
+        servers = self.get_all_servers()
+        return [s['id'] for s in servers
+                if (s.get('last_deploy_status') or 'never') in ('never', 'failed')]
+
+    def deploy_server(self, server, step_cb=None, mode='agent'):
+        """
+        完整部署流程，step_cb(msg) 在每个步骤回调供 GUI 实时显示。
+        mode='agent': 精简模式（6 子目录 + package-agent.json，PM2 跑 agent/server.js）
+        mode='full' : 完整模式（整个 gamyy-core 按排除规则上传 + 完整 package.json，PM2 跑 web/server.js）
+        返回 {'ok': bool, 'msg': str, 'status': dict}
+
+        per-server 锁：同一 server_id 同时只允许一个 deploy 在跑。重复发起立即返回失败。
+        """
+        host = server['server_host']
+        server_id = server['id']
+
+        # 进入锁：占用 _deploying_ids[server_id]
+        with self._deploying_lock:
+            if server_id in self._deploying_ids:
+                self._log(f"[{host}] 跳过：该服务器已有部署任务在运行", 'WARNING')
+                return {'ok': False, 'msg': '该服务器已有部署任务在运行', 'status': None}
+            self._deploying_ids.add(server_id)
+
+        client = None
+        try:
+            # 解析部署源（imported > synced > bundled > external）
+            source_root, source_kind = get_deploy_source()
+            if source_root is None:
+                self._log(f"[{host}] 找不到部署源（imported/synced/bundled/external 全部不可用）", 'ERROR')
+                return {'ok': False, 'msg': '找不到部署源', 'status': None}
+            self._log(f"[{host}] 使用部署源：{source_kind} ({source_root})", 'INFO')
+
+            self._step(step_cb, '连接SSH...')
+            self._log(f"[{host}] 开始部署（mode={mode}）...", 'INFO')
+            client = self._connect(server)
+
+            self._step(step_cb, '探测云厂商...')
+            cloud = self._resolve_cloud(server, client, host)
+
+            self._step(step_cb, '检测Node.js...')
+            self._ensure_nodejs(client, host, cloud)
+
+            self._step(step_cb, '检测PM2...')
+            self._ensure_pm2(client, host, cloud)
+
+            self._step(step_cb, '检测编译工具...')
+            self._ensure_build_tools(client, host)
+
+            self._step(step_cb, '上传文件...')
+            self._log(f"[{host}] 上传文件（mode={mode}）...", 'INFO')
+            self._upload_agent_files(client, host, source_root=source_root, mode=mode)
+            self._log(f"[{host}] 文件上传完成", 'SUCCESS')
+
+            self._step(step_cb, 'npm install...')
+            self._log(f"[{host}] npm install（{'完整模式 ~3-5 分钟' if mode == 'full' else '首次约1~2分钟'}）...", 'INFO')
+            self._npm_install_project(client, host, cloud, mode=mode)
+
+            # TLS 指纹 sidecar（开关控制）：先于 node 进程部署并拉起。
+            # 只有 sidecar 确实在线（sidecar_ok）才会给 node 注入 FP_SIDECAR_ADDR——
+            # 否则 agent 会连一个不存在的 sidecar，导致请求全部失败。
+            sidecar_ok = False
+            if FP_SIDECAR_ENABLED:
+                self._step(step_cb, '部署TLS指纹sidecar...')
+                remote_dir = AGENT_FULL_REMOTE_DIR if mode == 'full' else AGENT_REMOTE_DIR
+                if self._deploy_fp_sidecar(client, host, remote_dir, source_root):
+                    self._pm2_start_sidecar(client, host, remote_dir)
+                    self._step(step_cb, 'sidecar健康检查...')
+                    time.sleep(1)
+                    sidecar_ok = self._health_check_sidecar(client, host)
+                if not sidecar_ok:
+                    self._log(f"[{host}] sidecar 未就绪，node 进程保持原生 TLS（不注入 FP_SIDECAR_ADDR）", 'WARNING')
+
+            self._step(step_cb, '启动PM2...')
+            self._pm2_start_or_restart(client, host, mode=mode, inject_fp_env=sidecar_ok)
+
+            self._step(step_cb, '健康检查...')
+            time.sleep(2)
+            health, uptime, running_tasks = self._health_check(client, mode=mode)
+            status = {
+                'pm2': 'online' if health else 'started',
+                'health': health,
+                'uptime': uptime,
+                'running_tasks': running_tasks,
+            }
+            if health:
+                self._log(f"[{host}] 部署成功 ✅", 'SUCCESS')
+                self._write_deploy_status(server, 'success')
+                return {'ok': True, 'msg': 'deployed', 'status': status}
+            else:
+                self._log(f"[{host}] 部署完成但健康检查未通过", 'WARNING')
+                # 健康检查未通过仍记成功（PM2 已起、npm 已装），只是健康端点暂未就绪——
+                # 真挂掉会在下一次 status 检查体现。这里写 'success' 让"选择失败"不挑出来。
+                self._write_deploy_status(server, 'success')
+                return {'ok': True, 'msg': 'deployed_unhealthy', 'status': status}
+
+        except Exception as e:
+            self._log(f"[{host}] 部署失败: {e}", 'ERROR')
+            self._write_deploy_status(server, 'failed')
+            return {'ok': False, 'msg': str(e), 'status': None}
+        finally:
+            if client:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            # 释放 per-server 锁
+            with self._deploying_lock:
+                self._deploying_ids.discard(server_id)
+
+    def _write_deploy_status(self, server, status):
+        """部署完成后把结果写回 ssh_servers.last_deploy_status"""
+        try:
+            from database import ProxyDatabase
+            ProxyDatabase().update_server_deploy_status(server['id'], status)
+        except Exception as e:
+            self._log(f"[{server.get('server_host','?')}] last_deploy_status 写回失败: {e}", 'WARNING')
+
+    def start_server(self, server, step_cb=None):
+        host = server['server_host']
+        client = None
+        try:
+            self._step(step_cb, '连接SSH...')
+            client = self._connect(server)
+            self._step(step_cb, '启动PM2...')
+            self._pm2_start_or_restart(client, host)
+            self._step(step_cb, '健康检查...')
+            time.sleep(1)
+            health, uptime, running_tasks = self._health_check(client)
+            status = {'pm2': 'online' if health else 'started', 'health': health,
+                      'uptime': uptime, 'running_tasks': running_tasks}
+            return {'ok': True, 'msg': 'started', 'status': status}
+        except Exception as e:
+            self._log(f"[{host}] 启动失败: {e}", 'ERROR')
+            return {'ok': False, 'msg': str(e), 'status': None}
+        finally:
+            if client:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    def stop_server(self, server, step_cb=None):
+        host = server['server_host']
+        client = None
+        try:
+            self._step(step_cb, '连接SSH...')
+            client = self._connect(server)
+            self._step(step_cb, '停止PM2...')
+            out, _, _ = self._exec(client, f"pm2 stop {AGENT_PM2_NAME} 2>&1 || true", timeout=30)
+            self._log(f"[{host}] 停止: {out[:100]}", 'INFO')
+            status = {'pm2': 'stopped', 'health': False, 'uptime': None, 'running_tasks': None}
+            return {'ok': True, 'msg': 'stopped', 'status': status}
+        except Exception as e:
+            self._log(f"[{host}] 停止失败: {e}", 'ERROR')
+            return {'ok': False, 'msg': str(e), 'status': None}
+        finally:
+            if client:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    def restart_server(self, server, step_cb=None):
+        host = server['server_host']
+        client = None
+        try:
+            self._step(step_cb, '连接SSH...')
+            client = self._connect(server)
+            self._step(step_cb, '重启PM2...')
+            self._pm2_start_or_restart(client, host)
+            self._step(step_cb, '健康检查...')
+            time.sleep(1)
+            health, uptime, running_tasks = self._health_check(client)
+            status = {'pm2': 'online' if health else 'restarted', 'health': health,
+                      'uptime': uptime, 'running_tasks': running_tasks}
+            return {'ok': True, 'msg': 'restarted', 'status': status}
+        except Exception as e:
+            self._log(f"[{host}] 重启失败: {e}", 'ERROR')
+            return {'ok': False, 'msg': str(e), 'status': None}
+        finally:
+            if client:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    def get_server_status(self, server):
+        """
+        返回 {
+            'pm2': 'online'|'stopped'|'not_found'|'error',
+            'health': True|False,
+            'uptime': int|None,
+            'running_tasks': int|None,
+        }
+        """
+        host = server['server_host']
+        client = None
+        try:
+            client = self._connect(server, timeout=8)
+
+            # PM2 状态：仍用 pm2 show 但放宽到 30s 兜底慢盘 / 进程多时的延迟
+            out, _, code = self._exec(
+                client,
+                f"pm2 show {AGENT_PM2_NAME} 2>/dev/null | grep -E 'status|uptime' || echo NOT_FOUND",
+                timeout=30,
+            )
+            if 'NOT_FOUND' in out or code != 0:
+                pm2_status = 'not_found'
+            elif 'online' in out.lower():
+                pm2_status = 'online'
+            elif 'stopped' in out.lower() or 'errored' in out.lower():
+                pm2_status = 'stopped'
+            else:
+                pm2_status = 'unknown'
+
+            # HTTP 健康检查
+            health_out, _, _ = self._exec(
+                client,
+                f"curl -sf --max-time 3 http://localhost:{AGENT_PORT}/health 2>/dev/null || echo FAIL",
+                timeout=8,
+            )
+            health = '"status":"ok"' in health_out
+
+            running_tasks = None
+            uptime_sec = None
+            if health:
+                import json
+                try:
+                    data = json.loads(health_out)
+                    running_tasks = data.get('runningTasks')
+                    uptime_sec = data.get('uptime')
+                except Exception:
+                    pass
+
+            return {
+                'pm2': pm2_status,
+                'health': health,
+                'uptime': uptime_sec,
+                'running_tasks': running_tasks,
+            }
+        except Exception as e:
+            return {'pm2': 'error', 'health': False, 'uptime': None, 'running_tasks': None, 'error': str(e)}
+        finally:
+            if client:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    def get_server_logs(self, server, lines=100):
+        """获取 PM2 日志最后 N 行，返回字符串"""
+        host = server['server_host']
+        client = None
+        try:
+            client = self._connect(server)
+            out, err, _ = self._exec(
+                client,
+                f"pm2 logs {AGENT_PM2_NAME} --lines {lines} --nostream 2>&1",
+                timeout=30,
+            )
+            return out or err or '(无日志)'
+        except Exception as e:
+            return f'获取日志失败: {e}'
+        finally:
+            if client:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    def download_db(self, server, local_dir=None):
+        """
+        通过 SFTP 下载云端 ticket_checker.db 到本地。
+        返回 (ok, local_path_or_error_msg)
+        """
+        host = server['server_host']
+        save_dir = local_dir or AGENT_LOG_SAVE_DIR
+        os.makedirs(save_dir, exist_ok=True)
+
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"{host}_{ts}.db"
+        local_path = os.path.join(save_dir, filename)
+
+        client = None
+        try:
+            client = self._connect(server)
+            sftp = client.open_sftp()
+            try:
+                sftp.stat(AGENT_REMOTE_DB)  # 确认文件存在
+                sftp.get(AGENT_REMOTE_DB, local_path)
+            finally:
+                sftp.close()
+            self._log(f"[{host}] 日志DB已保存: {local_path}", 'SUCCESS')
+            return True, local_path
+        except FileNotFoundError:
+            msg = f"远端数据库不存在: {AGENT_REMOTE_DB}"
+            self._log(f"[{host}] {msg}", 'WARNING')
+            return False, msg
+        except Exception as e:
+            self._log(f"[{host}] 下载DB失败: {e}", 'ERROR')
+            return False, str(e)
+        finally:
+            if client:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    # ──────────────────────────────────────────────────────────
+    # 批量并发操作
+    # ──────────────────────────────────────────────────────────
+    # 入场抖动：批量任务开局所有 worker 同一瞬间冲向 _connect_sem，会让 SSH 握手
+    # SYN 在同一时刻爆发，触发云厂商 SYN 限流；给每个任务 0~JITTER 秒的随机入场延迟，
+    # 把"齐刷刷一波 SYN"摊成"几秒内均匀分散"。
+    _BATCH_JITTER_SECONDS = 3.0
+
+    def _batch_run(self, server_ids, op_func, max_workers, progress_cb=None, step_factory=None):
+        """
+        对 server_ids 对应的服务器并发执行 op_func(server, step_cb=...)。
+        progress_cb(done, total, server_id, host, result) 每完成一台调用一次。
+        step_factory(server_id, host) -> step_cb(msg)，可为 None。
+        返回 list[{'server_id', 'host', 'ok', 'msg', 'status'}]
+
+        每个 worker 入场前会 sleep 0~_BATCH_JITTER_SECONDS 秒，避免首波 SSH 握手扎堆。
+        """
+        # 一次 SQL 批量查询，替代串行 N 次单查
+        servers = self.get_servers_by_ids(server_ids)
+
+        total = len(servers)
+        results = []
+        done_count = 0
+
+        # I/O 密集型任务线程栈 512KB 足够，默认 8MB 会在高并发时浪费大量内存
+        # (Linux 生效；Windows 忽略)
+        try:
+            threading.stack_size(512 * 1024)
+        except Exception:
+            pass
+
+        # 抖动幅度：批量较小（<=10）时不抖；较大时按上限 _BATCH_JITTER_SECONDS
+        jitter = self._BATCH_JITTER_SECONDS if total > 10 else 0.0
+
+        def _with_jitter(server, step_cb):
+            if jitter > 0:
+                time.sleep(random.uniform(0, jitter))
+            return op_func(server, step_cb)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_server = {}
+            for s in servers:
+                step_cb = step_factory(s['id'], s['server_host']) if step_factory else None
+                future = pool.submit(_with_jitter, s, step_cb)
+                future_to_server[future] = s
+
+            for future in as_completed(future_to_server):
+                s = future_to_server[future]
+                try:
+                    res = future.result()
+                except Exception as e:
+                    res = {'ok': False, 'msg': str(e), 'status': None}
+
+                done_count += 1
+                entry = {
+                    'server_id': s['id'],
+                    'host':      s['server_host'],
+                    'ok':        res.get('ok', False),
+                    'msg':       res.get('msg', ''),
+                    'status':    res.get('status'),
+                }
+                results.append(entry)
+
+                if progress_cb:
+                    try:
+                        progress_cb(done_count, total, s['id'], s['server_host'], res)
+                    except Exception:
+                        pass
+
+        return results
+
+    def batch_deploy(self, server_ids, progress_cb=None, step_factory=None, mode='agent'):
+        """批量部署。mode='agent'（精简）或 'full'（完整项目，跑 web/server.js）
+
+        入口先按 _deploying_ids 过滤一遍：已在部署中的 ID 不再下发 worker。
+        这是 GUI 弹窗"自动跳过"语义的真实落地——避免同台 SSH/SFTP/npm 撞车。
+        （deploy_server 内部也有 per-server 锁兜底，是防御性双保险。）
+        """
+        with self._deploying_lock:
+            filtered_ids = [i for i in server_ids if i not in self._deploying_ids]
+        skipped = len(server_ids) - len(filtered_ids)
+        if skipped > 0:
+            self._log(f"批量部署：跳过 {skipped} 台正在部署中的服务器", 'INFO')
+
+        def _do(server, step_cb):
+            return self.deploy_server(server, step_cb, mode=mode)
+        return self._batch_run(filtered_ids, _do, AGENT_DEPLOY_WORKERS, progress_cb, step_factory)
+
+    def batch_start(self, server_ids, progress_cb=None, step_factory=None):
+        return self._batch_run(server_ids, self.start_server, AGENT_OP_WORKERS, progress_cb, step_factory)
+
+    def batch_stop(self, server_ids, progress_cb=None, step_factory=None):
+        return self._batch_run(server_ids, self.stop_server, AGENT_OP_WORKERS, progress_cb, step_factory)
+
+    def batch_restart(self, server_ids, progress_cb=None, step_factory=None):
+        return self._batch_run(server_ids, self.restart_server, AGENT_OP_WORKERS, progress_cb, step_factory)
+
+    def batch_status(self, server_ids, progress_cb=None):
+        """返回 list[{'server_id','host','pm2','health','uptime','running_tasks'}]"""
+        servers = self.get_servers_by_ids(server_ids)
+
+        total = len(servers)
+        results = []
+        done_count = 0
+
+        with ThreadPoolExecutor(max_workers=AGENT_OP_WORKERS) as pool:
+            future_to_server = {pool.submit(self.get_server_status, s): s for s in servers}
+            for future in as_completed(future_to_server):
+                s = future_to_server[future]
+                try:
+                    status = future.result()
+                except Exception as e:
+                    status = {'pm2': 'error', 'health': False, 'uptime': None, 'running_tasks': None}
+
+                done_count += 1
+                entry = {
+                    'server_id': s['id'],
+                    'host': s['server_host'],
+                    **status,
+                }
+                results.append(entry)
+
+                if progress_cb:
+                    try:
+                        progress_cb(done_count, total, s['id'], s['server_host'], status)
+                    except Exception:
+                        pass
+
+        return results
+
+    def batch_download_db(self, server_ids, local_dir=None, progress_cb=None):
+        """并发下载多台服务器的日志DB"""
+        servers = self.get_servers_by_ids(server_ids)
+
+        total = len(servers)
+        results = []
+        done_count = 0
+
+        def _do(s):
+            return self.download_db(s, local_dir)
+
+        with ThreadPoolExecutor(max_workers=AGENT_OP_WORKERS) as pool:
+            future_to_server = {pool.submit(_do, s): s for s in servers}
+            for future in as_completed(future_to_server):
+                s = future_to_server[future]
+                try:
+                    ok, path = future.result()
+                except Exception as e:
+                    ok, path = False, str(e)
+
+                done_count += 1
+                results.append({'server_id': s['id'], 'host': s['server_host'], 'ok': ok, 'path': path})
+
+                if progress_cb:
+                    try:
+                        progress_cb(done_count, total, s['id'], s['server_host'], {'ok': ok, 'path': path})
+                    except Exception:
+                        pass
+
+        return results
+
+    # ──────────────────────────────────────────────────────────
+    # 内部工具
+    # ──────────────────────────────────────────────────────────
+    def _deploy_fp_sidecar(self, client, host, remote_dir, source_root):
+        """上传 fp-sidecar Linux 二进制到 remote_dir/fp-sidecar/ 并 chmod +x。
+        返回 True=二进制已就位；False=本地缺二进制（跳过，不阻断部署）。
+        """
+        # 优先用部署源副本里的二进制；副本通常不含编译产物，回退到稳定构建目录 FP_SIDECAR_BINARY。
+        local_bin = os.path.join(source_root, FP_SIDECAR_BINARY_REL)
+        if not os.path.isfile(local_bin):
+            local_bin = FP_SIDECAR_BINARY
+        if not os.path.isfile(local_bin):
+            self._log(f"[{host}] 未找到本地 sidecar 二进制（源副本与 {FP_SIDECAR_BINARY} 均无），跳过 sidecar 部署"
+                      f"（需先 GOOS=linux GOARCH=amd64 go build 产出 Linux 二进制）", 'WARNING')
+            return False
+        self._log(f"[{host}] 使用 sidecar 二进制: {local_bin}", 'INFO')
+        remote_sub = f"{remote_dir}/{FP_SIDECAR_REMOTE_SUBDIR}"
+        remote_bin = f"{remote_sub}/fp-sidecar"
+        sftp = client.open_sftp()
+        try:
+            self._sftp_mkdir_p(sftp, remote_sub)
+            sftp.put(local_bin, remote_bin)
+        finally:
+            sftp.close()
+        self._exec(client, f"chmod +x {remote_bin}", timeout=15)
+        self._log(f"[{host}] sidecar 二进制已上传 {remote_bin}", 'SUCCESS')
+        return True
+
+    def _pm2_start_sidecar(self, client, host, remote_dir):
+        """PM2 启动/重启 fp-sidecar（监听 FP_SIDECAR_ADDR）。"""
+        remote_bin = f"{remote_dir}/{FP_SIDECAR_REMOTE_SUBDIR}/fp-sidecar"
+        out, _, _ = self._exec(
+            client,
+            f"pm2 jlist 2>/dev/null | grep -q '\"name\":\"{FP_SIDECAR_PM2_NAME}\"' && echo EXISTS || echo NOTEXIST",
+            timeout=30,
+        )
+        if 'EXISTS' in out:
+            self._log(f"[{host}] PM2 重启 {FP_SIDECAR_PM2_NAME}...", 'INFO')
+            self._exec(client, f"pm2 restart {FP_SIDECAR_PM2_NAME}", timeout=30)
+        else:
+            self._log(f"[{host}] PM2 首次启动 {FP_SIDECAR_PM2_NAME}（{FP_SIDECAR_ADDR}）...", 'INFO')
+            self._exec(
+                client,
+                f"pm2 start {remote_bin} --name {FP_SIDECAR_PM2_NAME} --interpreter none -- -addr {FP_SIDECAR_ADDR}",
+                timeout=30,
+            )
+        self._exec(client, "pm2 save", timeout=30)
+        self._log(f"[{host}] sidecar 启动完成", 'SUCCESS')
+
+    def _health_check_sidecar(self, client, host):
+        """部署后健康检查：确认 sidecar 端口在听 + 隧道能连目标。
+        功能探测：向 sidecar 发一个 CONNECT（preset 指纹，直连目标），回 200 即证明
+        "端口起来了 + 隧道能连上"。未回 200 时再用 pm2 区分"进程没起"与"起了但目标不可达"。
+        返回 True=隧道连通；False=未连通（已记日志，不阻断部署）。
+        """
+        import json
+        import base64
+        fp = base64.b64encode(json.dumps(
+            {"mode": "preset", "clientHello": "HelloChrome_Auto", "alpn": ["h2", "http/1.1"]}
+        ).encode()).decode()
+
+        ci = FP_SIDECAR_ADDR.rfind(':')
+        shost = FP_SIDECAR_ADDR[:ci] or '127.0.0.1'
+        sport = FP_SIDECAR_ADDR[ci + 1:]
+        target = FP_SIDECAR_PROBE_TARGET
+
+        # bash /dev/tcp 发 CONNECT，读首行响应。connect 失败则 resp 为空。
+        probe = (
+            f"exec 3<>/dev/tcp/{shost}/{sport} 2>/dev/null && "
+            f"printf 'CONNECT {target} HTTP/1.1\\r\\nHost: {target}\\r\\nX-Fingerprint: {fp}\\r\\n\\r\\n' >&3 && "
+            f"timeout 6 head -1 <&3; exec 3<&- 3>&- 2>/dev/null"
+        )
+        resp, _, _ = self._exec(client, f"bash -c \"{probe}\"", timeout=12)
+
+        if '200' in resp:
+            self._log(f"[{host}] sidecar 健康检查通过：{shost}:{sport} 在听，隧道可连 {target} ✅", 'SUCCESS')
+            return True
+
+        pm2_out, _, _ = self._exec(
+            client,
+            f"pm2 jlist 2>/dev/null | grep -q '\"name\":\"{FP_SIDECAR_PM2_NAME}\"' && echo UP || echo DOWN",
+            timeout=15,
+        )
+        if 'UP' in pm2_out:
+            # 进程在线、端口可用 → 视为可用（可注入 env）；目标可达性是另一回事（网络层）
+            self._log(f"[{host}] sidecar 进程在线但隧道探测未通（目标 {target} 可能不可达/被防火墙拦），"
+                      f"resp={resp.strip()[:80]}", 'WARNING')
+            return True
+        self._log(f"[{host}] sidecar 未在线（PM2 无 {FP_SIDECAR_PM2_NAME}），端口 {sport} 未起", 'ERROR')
+        return False
+
+    def _pm2_start_or_restart(self, client, host, mode='agent', inject_fp_env=False):
+        """PM2 重启（已存在）或首次启动。改用 pm2 jlist 快速检测存在性，超时放宽到 30s。
+
+        mode='agent': PM2 名 gamyy-agent，cd AGENT_REMOTE_DIR && pm2 start agent/server.js
+        mode='full' : PM2 名 gamyy-web，cd AGENT_FULL_REMOTE_DIR && pm2 start web/server.js
+
+        inject_fp_env=True（仅当 sidecar 已部署并在线时由 deploy_server 传入）：
+        给 node 进程注入 FP_SIDECAR_ADDR，使 connectionChannel/account 经 sidecar 施加 TLS 指纹。
+        sidecar 没起来时绝不注入——否则 agent 会连一个不存在的 sidecar 导致请求全失败。
+        """
+        if mode == 'full':
+            pm2_name = AGENT_FULL_PM2_NAME
+            remote_dir = AGENT_FULL_REMOTE_DIR
+            entry_script = 'web/server.js'
+        else:
+            pm2_name = AGENT_PM2_NAME
+            remote_dir = AGENT_REMOTE_DIR
+            entry_script = 'agent/server.js'
+
+        env_prefix = f"FP_SIDECAR_ADDR={FP_SIDECAR_ADDR} " if inject_fp_env else ""
+
+        out, _, code = self._exec(
+            client,
+            f"pm2 jlist 2>/dev/null | grep -q '\"name\":\"{pm2_name}\"' && echo EXISTS || echo NOTEXIST",
+            timeout=30,
+        )
+        if 'EXISTS' in out:
+            self._log(f"[{host}] PM2 重启 {pm2_name}...", 'INFO')
+            # --update-env 让 restart 重新读取上面注入的环境变量
+            restart_flag = ' --update-env' if inject_fp_env else ''
+            self._exec(client, f"{env_prefix}pm2 restart {pm2_name}{restart_flag}", timeout=30)
+        else:
+            self._log(f"[{host}] PM2 首次启动 {pm2_name}...", 'INFO')
+            self._exec(
+                client,
+                f"cd {remote_dir} && {env_prefix}pm2 start {entry_script} --name {pm2_name}",
+                timeout=30,
+            )
+        self._exec(client, "pm2 save", timeout=30)
+        self._log(f"[{host}] PM2 启动完成", 'SUCCESS')
