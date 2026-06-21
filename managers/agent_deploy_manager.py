@@ -160,7 +160,7 @@ class AgentDeployManager:
         conn = sqlite3.connect(self.db_file)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        cur.execute('SELECT id, name, server_host, server_port, username, password, cloud_provider, last_deploy_status FROM ssh_servers ORDER BY id')
+        cur.execute('SELECT id, name, server_host, server_port, username, password, cloud_provider, last_deploy_status, deploy_mode FROM ssh_servers ORDER BY id')
         rows = [dict(r) for r in cur.fetchall()]
         conn.close()
         return rows
@@ -169,7 +169,7 @@ class AgentDeployManager:
         conn = sqlite3.connect(self.db_file)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        cur.execute('SELECT id, name, server_host, server_port, username, password, cloud_provider, last_deploy_status FROM ssh_servers WHERE id=?', (server_id,))
+        cur.execute('SELECT id, name, server_host, server_port, username, password, cloud_provider, last_deploy_status, deploy_mode FROM ssh_servers WHERE id=?', (server_id,))
         row = cur.fetchone()
         conn.close()
         return dict(row) if row else None
@@ -187,7 +187,7 @@ class AgentDeployManager:
         placeholders = ','.join('?' * len(server_ids))
         cur.execute(
             f'SELECT id, name, server_host, server_port, username, password, '
-            f'cloud_provider, last_deploy_status '
+            f'cloud_provider, last_deploy_status, deploy_mode '
             f'FROM ssh_servers WHERE id IN ({placeholders})',
             list(server_ids)
         )
@@ -849,18 +849,18 @@ class AgentDeployManager:
             }
             if health:
                 self._log(f"[{host}] 部署成功 ✅", 'SUCCESS')
-                self._write_deploy_status(server, 'success')
+                self._write_deploy_status(server, 'success', mode)
                 return {'ok': True, 'msg': 'deployed', 'status': status}
             else:
                 self._log(f"[{host}] 部署完成但健康检查未通过", 'WARNING')
                 # 健康检查未通过仍记成功（PM2 已起、npm 已装），只是健康端点暂未就绪——
                 # 真挂掉会在下一次 status 检查体现。这里写 'success' 让"选择失败"不挑出来。
-                self._write_deploy_status(server, 'success')
+                self._write_deploy_status(server, 'success', mode)
                 return {'ok': True, 'msg': 'deployed_unhealthy', 'status': status}
 
         except Exception as e:
             self._log(f"[{host}] 部署失败: {e}", 'ERROR')
-            self._write_deploy_status(server, 'failed')
+            self._write_deploy_status(server, 'failed', mode)
             return {'ok': False, 'msg': str(e), 'status': None}
         finally:
             if client:
@@ -872,25 +872,28 @@ class AgentDeployManager:
             with self._deploying_lock:
                 self._deploying_ids.discard(server_id)
 
-    def _write_deploy_status(self, server, status):
-        """部署完成后把结果写回 ssh_servers.last_deploy_status"""
+    def _write_deploy_status(self, server, status, mode=None):
+        """部署完成后把结果写回 ssh_servers.last_deploy_status + deploy_mode"""
         try:
-            from database import ProxyDatabase
-            ProxyDatabase().update_server_deploy_status(server['id'], status)
+            db = ProxyDatabase()
+            db.update_server_deploy_status(server['id'], status)
+            if mode:
+                db.update_server_deploy_mode(server['id'], mode)
         except Exception as e:
-            self._log(f"[{server.get('server_host','?')}] last_deploy_status 写回失败: {e}", 'WARNING')
+            self._log(f"[{server.get('server_host','?')}] 状态写回失败: {e}", 'WARNING')
 
     def start_server(self, server, step_cb=None):
         host = server['server_host']
+        mode = server.get('deploy_mode', 'agent')
         client = None
         try:
             self._step(step_cb, '连接SSH...')
             client = self._connect(server)
-            self._step(step_cb, '启动PM2...')
-            self._pm2_start_or_restart(client, host)
+            self._step(step_cb, f'启动服务 (mode={mode})...')
+            self._pm2_start_or_restart(client, host, mode=mode)
             self._step(step_cb, '健康检查...')
             time.sleep(1)
-            health, uptime, running_tasks = self._health_check(client)
+            health, uptime, running_tasks = self._health_check(client, mode=mode)
             status = {'pm2': 'online' if health else 'started', 'health': health,
                       'uptime': uptime, 'running_tasks': running_tasks}
             return {'ok': True, 'msg': 'started', 'status': status}
@@ -906,19 +909,24 @@ class AgentDeployManager:
 
     def stop_server(self, server, step_cb=None):
         host = server['server_host']
+        mode = server.get('deploy_mode', 'agent')
+        port = AGENT_FULL_PORT if mode == 'full' else AGENT_PORT
+        pm2_name = AGENT_FULL_PM2_NAME if mode == 'full' else AGENT_PM2_NAME
         client = None
         try:
             self._step(step_cb, '连接SSH...')
             client = self._connect(server)
             is_windows = self._detect_os(client) == 'windows'
             if is_windows:
-                self._step(step_cb, '停止 node...')
-                # 杀所有 node.exe（Windows 上没有 PM2，直接 taskkill）
-                self._exec(client, "taskkill /f /im node.exe 2>nul & echo done", timeout=15)
-                self._log(f"[{host}] 已停止所有 node 进程", 'INFO')
+                self._step(step_cb, f'停止 node (端口 {port})...')
+                # 按端口杀进程（只杀当前模式的，不影响其他 node 进程）
+                self._exec(client,
+                    f"for /f \"tokens=5\" %p in ('netstat -ano 2^>nul ^| findstr :{port} ^| findstr LISTENING') do @taskkill /f /pid %p >nul 2>&1",
+                    timeout=15)
+                self._log(f"[{host}] 已停止端口 {port} 的进程", 'INFO')
             else:
-                self._step(step_cb, '停止PM2...')
-                out, _, _ = self._exec(client, f"pm2 stop {AGENT_PM2_NAME} 2>&1 || true", timeout=30)
+                self._step(step_cb, f'停止PM2 ({pm2_name})...')
+                out, _, _ = self._exec(client, f"pm2 stop {pm2_name} 2>&1 || true", timeout=30)
                 self._log(f"[{host}] 停止: {out[:100]}", 'INFO')
             status = {'pm2': 'stopped', 'health': False, 'uptime': None, 'running_tasks': None}
             return {'ok': True, 'msg': 'stopped', 'status': status}
@@ -934,20 +942,24 @@ class AgentDeployManager:
 
     def restart_server(self, server, step_cb=None):
         host = server['server_host']
+        mode = server.get('deploy_mode', 'agent')
+        port = AGENT_FULL_PORT if mode == 'full' else AGENT_PORT
         client = None
         try:
             self._step(step_cb, '连接SSH...')
             client = self._connect(server)
             is_windows = self._detect_os(client) == 'windows'
             if is_windows:
-                self._step(step_cb, '停止旧进程...')
-                self._exec(client, "taskkill /f /im node.exe 2>nul & echo done", timeout=15)
+                self._step(step_cb, f'停止旧进程 (端口 {port})...')
+                self._exec(client,
+                    f"for /f \"tokens=5\" %p in ('netstat -ano 2^>nul ^| findstr :{port} ^| findstr LISTENING') do @taskkill /f /pid %p >nul 2>&1",
+                    timeout=15)
                 time.sleep(1)
-            self._step(step_cb, '重启服务...')
-            self._pm2_start_or_restart(client, host, mode='agent')
+            self._step(step_cb, f'重启服务 (mode={mode})...')
+            self._pm2_start_or_restart(client, host, mode=mode)
             self._step(step_cb, '健康检查...')
             time.sleep(1)
-            health, uptime, running_tasks = self._health_check(client)
+            health, uptime, running_tasks = self._health_check(client, mode=mode)
             status = {'pm2': 'online' if health else 'restarted', 'health': health,
                       'uptime': uptime, 'running_tasks': running_tasks}
             return {'ok': True, 'msg': 'restarted', 'status': status}
@@ -971,6 +983,9 @@ class AgentDeployManager:
         }
         """
         host = server['server_host']
+        mode = server.get('deploy_mode', 'agent')
+        port = AGENT_FULL_PORT if mode == 'full' else AGENT_PORT
+        pm2_name = AGENT_FULL_PM2_NAME if mode == 'full' else AGENT_PM2_NAME
         client = None
         try:
             client = self._connect(server, timeout=8)
@@ -980,14 +995,14 @@ class AgentDeployManager:
                 # Windows: 用 netstat 检测端口是否监听
                 out, _, code = self._exec(
                     client,
-                    f"netstat -ano 2>nul | findstr :{AGENT_PORT} | findstr LISTENING >nul && echo online || echo stopped",
+                    f"netstat -ano 2>nul | findstr :{port} | findstr LISTENING >nul && echo online || echo stopped",
                     timeout=15,
                 )
                 pm2_status = 'online' if 'online' in out else 'stopped'
                 # 健康检查用 PowerShell
                 health_cmd = (
                     f"powershell -Command \"try {{ "
-                    f"$r=Invoke-WebRequest -Uri 'http://localhost:{AGENT_PORT}/health' "
+                    f"$r=Invoke-WebRequest -Uri 'http://localhost:{port}/health' "
                     f"-UseBasicParsing -TimeoutSec 3; Write-Host $r.Content "
                     f"}} catch {{ Write-Host 'FAIL' }}\""
                 )
@@ -995,7 +1010,7 @@ class AgentDeployManager:
                 # PM2 状态
                 out, _, code = self._exec(
                     client,
-                    f"pm2 show {AGENT_PM2_NAME} 2>/dev/null | grep -E 'status|uptime' || echo NOT_FOUND",
+                    f"pm2 show {pm2_name} 2>/dev/null | grep -E 'status|uptime' || echo NOT_FOUND",
                     timeout=30,
                 )
                 if 'NOT_FOUND' in out or code != 0:
@@ -1007,7 +1022,7 @@ class AgentDeployManager:
                 else:
                     pm2_status = 'unknown'
                 # HTTP 健康检查
-                health_cmd = f"curl -sf --max-time 3 http://localhost:{AGENT_PORT}/health 2>/dev/null || echo FAIL"
+                health_cmd = f"curl -sf --max-time 3 http://localhost:{port}/health 2>/dev/null || echo FAIL"
 
             health_out, _, _ = self._exec(client, health_cmd, timeout=8)
             health = '"status":"ok"' in health_out

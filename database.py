@@ -149,6 +149,12 @@ class ProxyDatabase:
         except sqlite3.OperationalError:
             cursor.execute("ALTER TABLE ssh_servers ADD COLUMN last_deploy_status TEXT NOT NULL DEFAULT 'never'")
 
+        # 幂等迁移：ssh_servers 加 deploy_mode 字段（'agent' / 'full'）
+        try:
+            cursor.execute("SELECT deploy_mode FROM ssh_servers LIMIT 1")
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE ssh_servers ADD COLUMN deploy_mode TEXT NOT NULL DEFAULT 'agent'")
+
         conn.commit()
         conn.close()
 
@@ -202,6 +208,18 @@ class ProxyDatabase:
             conn = sqlite3.connect(self.db_file, timeout=10)
             cur = conn.cursor()
             cur.execute('UPDATE ssh_servers SET last_deploy_status = ? WHERE id = ?', (status, server_id))
+            conn.commit()
+            conn.close()
+            return cur.rowcount > 0
+        except Exception:
+            return False
+
+    def update_server_deploy_mode(self, server_id, mode):
+        """更新服务器的部署模式（'agent' / 'full'）"""
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=10)
+            cur = conn.cursor()
+            cur.execute('UPDATE ssh_servers SET deploy_mode = ? WHERE id = ?', (mode, server_id))
             conn.commit()
             conn.close()
             return cur.rowcount > 0

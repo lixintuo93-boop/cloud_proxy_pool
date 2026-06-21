@@ -2424,11 +2424,11 @@ class ProxyManagerGUI:
         list_frame = ttk.LabelFrame(frame, text="云服务器列表", padding="3")
         list_frame.pack(fill=tk.BOTH, expand=True)
 
-        cols = ("选择", "ID", "名称", "服务器IP", "SSH端口", "服务器平台", "部署状态", "PM2状态", "健康", "任务数", "运行时间(s)", "操作状态")
+        cols = ("选择", "ID", "名称", "服务器IP", "SSH端口", "服务器平台", "部署状态", "部署模式", "PM2状态", "健康", "任务数", "运行时间(s)", "操作状态")
         self.agent_tree = ttk.Treeview(list_frame, columns=cols, show="headings", height=12)
 
-        widths = [30, 40, 80, 130, 65, 70, 70, 80, 60, 60, 90, 140]
-        aligns = ["center"] * 11 + ["w"]
+        widths = [30, 40, 80, 130, 65, 70, 70, 70, 80, 60, 60, 90, 140]
+        aligns = ["center"] * 12 + ["w"]
         for col, w, a in zip(cols, widths, aligns):
             self.agent_tree.heading(col, text=col)
             self.agent_tree.column(col, width=w, anchor=a, minwidth=w)
@@ -2460,6 +2460,7 @@ class ProxyManagerGUI:
     # 平台/部署状态文案映射（与代理 tab 保持一致）
     _PLATFORM_LABEL = {'auto': '未探测', 'aliyun': '阿里云', 'tencent': '腾讯云', 'default': '其他'}
     _DEPLOY_LABEL   = {'never': '未部署', 'success': '✅ 成功', 'failed': '❌ 失败'}
+    _MODE_LABEL     = {'agent': '🔹 Agent', 'full': '🔶 完整'}
 
     def _agent_load_servers(self):
         """从 DB 加载服务器列表到 Treeview（不查询状态，只填 IP/端口/平台/部署状态）"""
@@ -2473,9 +2474,10 @@ class ProxyManagerGUI:
         for s in servers:
             platform = self._PLATFORM_LABEL.get(s.get('cloud_provider') or 'auto', '未探测')
             deploy   = self._DEPLOY_LABEL.get(s.get('last_deploy_status') or 'never', '未部署')
+            dmode    = self._MODE_LABEL.get(s.get('deploy_mode') or 'agent', '🔹 Agent')
             self.agent_tree.insert('', tk.END, iid=str(s['id']), values=(
                 '', s['id'], s['name'], s['server_host'], s['server_port'],
-                platform, deploy,
+                platform, deploy, dmode,
                 '—', '—', '—', '—', '',
             ))
         self._agent_update_select_label()
@@ -2569,8 +2571,8 @@ class ProxyManagerGUI:
     def _agent_update_row(self, server_id, pm2, health, uptime, running_tasks, op_status=None):
         """在主线程更新某行状态列（可选更新操作状态列）
 
-        当前列顺序：选择(0) ID(1) 名称(2) 服务器IP(3) SSH端口(4) 服务器平台(5) 部署状态(6)
-                  PM2状态(7) 健康(8) 任务数(9) 运行时间(s)(10) 操作状态(11)
+        当前列顺序：选择(0) ID(1) 名称(2) 服务器IP(3) SSH端口(4) 服务器平台(5) 部署状态(6) 部署模式(7)
+                  PM2状态(8) 健康(9) 任务数(10) 运行时间(s)(11) 操作状态(12)
         """
         iid = str(server_id)
         pm2_disp = pm2
@@ -2584,12 +2586,12 @@ class ProxyManagerGUI:
             try:
                 if self.agent_tree.exists(iid):
                     vals = list(self.agent_tree.item(iid, 'values'))
-                    vals[7]  = pm2_disp
-                    vals[8]  = health_disp
-                    vals[9]  = tasks_disp
-                    vals[10] = uptime_disp
+                    vals[8]  = pm2_disp
+                    vals[9]  = health_disp
+                    vals[10] = tasks_disp
+                    vals[11] = uptime_disp
                     if op_status is not None:
-                        vals[11] = op_status
+                        vals[12] = op_status
                     self.agent_tree.item(iid, values=vals, tags=(tag,))
             except Exception:
                 pass
