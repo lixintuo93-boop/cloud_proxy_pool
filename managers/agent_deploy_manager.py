@@ -538,17 +538,19 @@ class AgentDeployManager:
         raise RuntimeError(f"Node.js 安装失败（已尝试 {max_attempts} 次）：{last_reason}")
 
     def _ensure_pm2(self, client, server_host, cloud='default'):
-        """确保 PM2 已安装。失败重试 7 次×60s，间隔 3/8/15/25/40/60s + 0~50% 抖动；按云走 npm 镜像。"""
-        is_windows = self._detect_os(client) == 'windows'
-        detect_cmd = "pm2 -v 2>nul || echo NOT_FOUND" if is_windows else "pm2 -v 2>/dev/null || echo NOT_FOUND"
+        """确保 PM2 已安装（Windows 上不使用 PM2，直接跳过）。"""
+        if self._detect_os(client) == 'windows':
+            self._log(f"[{server_host}] Windows 环境，跳过 PM2（使用 node 直接启动）", 'INFO')
+            return True
+
+        detect_cmd = "pm2 -v 2>/dev/null || echo NOT_FOUND"
         out, _, code = self._exec(client, detect_cmd, timeout=10)
         if code == 0 and out != 'NOT_FOUND' and out.strip():
             self._log(f"[{server_host}] PM2 {out} 已安装，跳过", 'INFO')
             return True
 
         registry = self._npm_registry_arg(cloud)
-        sudo = "" if is_windows else "sudo "
-        install_cmd = f"{sudo}npm install -g {registry}pm2"
+        install_cmd = f"sudo npm install -g {registry}pm2"
 
         max_attempts = self._PM2_MAX_ATTEMPTS
         last_reason = ''
@@ -722,13 +724,19 @@ class AgentDeployManager:
         is_windows = self._detect_os(client) == 'windows'
 
         if mode == 'full':
-            curl_cmd = (
-                f"curl -s -o nul --max-time 3 -w '%{{http_code}}' "
-                f"http://localhost:{AGENT_FULL_PORT}/ 2>nul || echo 000"
-                if is_windows else
-                f"curl -s -o /dev/null --max-time 3 -w '%{{http_code}}' "
-                f"http://localhost:{AGENT_FULL_PORT}/ 2>/dev/null || echo 000"
-            )
+            if is_windows:
+                curl_cmd = (
+                    f"powershell -Command \"try {{ "
+                    f"$r=Invoke-WebRequest -Uri 'http://localhost:{AGENT_FULL_PORT}/' "
+                    f"-UseBasicParsing -TimeoutSec 3; "
+                    f"Write-Host $r.StatusCode "
+                    f"}} catch {{ Write-Host '000' }}\""
+                )
+            else:
+                curl_cmd = (
+                    f"curl -s -o /dev/null --max-time 3 -w '%{{http_code}}' "
+                    f"http://localhost:{AGENT_FULL_PORT}/ 2>/dev/null || echo 000"
+                )
             code_out, _, _ = self._exec(client, curl_cmd, timeout=8)
             try:
                 hc = int(code_out.strip()[:3])
@@ -736,11 +744,18 @@ class AgentDeployManager:
                 hc = 0
             return 200 <= hc < 400, None, None
 
-        health_cmd = (
-            f"curl -sf --max-time 3 http://localhost:{AGENT_PORT}/health 2>nul || echo FAIL"
-            if is_windows else
-            f"curl -sf --max-time 3 http://localhost:{AGENT_PORT}/health 2>/dev/null || echo FAIL"
-        )
+        if is_windows:
+            health_cmd = (
+                f"powershell -Command \"try {{ "
+                f"$r=Invoke-WebRequest -Uri 'http://localhost:{AGENT_PORT}/health' "
+                f"-UseBasicParsing -TimeoutSec 3; "
+                f"Write-Host $r.Content "
+                f"}} catch {{ Write-Host 'FAIL' }}\""
+            )
+        else:
+            health_cmd = (
+                f"curl -sf --max-time 3 http://localhost:{AGENT_PORT}/health 2>/dev/null || echo FAIL"
+            )
         health_out, _, _ = self._exec(client, health_cmd, timeout=8)
         health = '"status":"ok"' in health_out
         uptime, running_tasks = None, None
@@ -1326,43 +1341,68 @@ class AgentDeployManager:
         return False
 
     def _pm2_start_or_restart(self, client, host, mode='agent', inject_fp_env=False):
-        """PM2 重启（已存在）或首次启动。改用 pm2 jlist 快速检测存在性，超时放宽到 30s。
+        """启动/重启服务进程。
 
-        mode='agent': PM2 名 gamyy-agent，cd AGENT_REMOTE_DIR && pm2 start agent/server.js
-        mode='full' : PM2 名 gamyy-web，cd AGENT_FULL_REMOTE_DIR && pm2 start web/server.js
-
-        inject_fp_env=True（仅当 sidecar 已部署并在线时由 deploy_server 传入）：
-        给 node 进程注入 FP_SIDECAR_ADDR，使 connectionChannel/account 经 sidecar 施加 TLS 指纹。
-        sidecar 没起来时绝不注入——否则 agent 会连一个不存在的 sidecar 导致请求全失败。
+        Linux: PM2 管理
+        Windows: PowerShell Start-Process 后台启动（PM2 在 Windows 上不稳定）
         """
         is_windows = self._detect_os(client) == 'windows'
 
         if mode == 'full':
-            pm2_name = AGENT_FULL_PM2_NAME
+            proc_name = AGENT_FULL_PM2_NAME   # 复用 PM2 名作为进程标识
             entry_script = 'web/server.js'
+            port = AGENT_FULL_PORT
         else:
-            pm2_name = AGENT_PM2_NAME
+            proc_name = AGENT_PM2_NAME
             entry_script = 'agent/server.js'
+            port = AGENT_PORT
         remote_dir = self._resolve_remote_dir(client, mode)
 
         env_prefix = f"FP_SIDECAR_ADDR={FP_SIDECAR_ADDR} " if inject_fp_env else ""
 
+        if is_windows:
+            # --- Windows: 直接 node 后台进程 ---
+            # 1. 杀掉旧进程（按端口）
+            kill_cmd = (
+                f"for /f \"tokens=5\" %p in ('netstat -ano ^| findstr :{port} ^| findstr LISTENING') do "
+                f"@taskkill /f /pid %p >nul 2>&1"
+            )
+            self._exec(client, kill_cmd, timeout=10)
+
+            # 2. 后台启动
+            log_file = f"{remote_dir}/server.log".replace('/', '\\')
+            start_cmd = (
+                f"powershell -Command \""
+                f"Start-Process -NoNewWindow -FilePath 'node' "
+                f"-ArgumentList '{entry_script}' "
+                f"-WorkingDirectory '{remote_dir}' "
+                f"-RedirectStandardOutput '{log_file}' "
+                f"-RedirectStandardError '{log_file}'"
+                f"\""
+            )
+            self._log(f"[{host}] Windows 后台启动 node {entry_script}...", 'INFO')
+            out, err, code = self._exec(client, start_cmd, timeout=15)
+            if code != 0:
+                self._log(f"[{host}] 启动命令返回非零: {code} {err[:120]}", 'WARNING')
+            # 给 node 几秒启动
+            time.sleep(3)
+            self._log(f"[{host}] Windows 服务启动完成（node 直接运行，日志: {log_file}）", 'SUCCESS')
+            return
+
+        # --- Linux: PM2 ---
         detect_cmd = (
-            f"pm2 jlist 2>nul | findstr \"{pm2_name}\" >nul && echo EXISTS || echo NOTEXIST"
-            if is_windows else
-            f"pm2 jlist 2>/dev/null | grep -q '\"name\":\"{pm2_name}\"' && echo EXISTS || echo NOTEXIST"
+            f"pm2 jlist 2>/dev/null | grep -q '\"name\":\"{proc_name}\"' && echo EXISTS || echo NOTEXIST"
         )
         out, _, code = self._exec(client, detect_cmd, timeout=30)
         if 'EXISTS' in out:
-            self._log(f"[{host}] PM2 重启 {pm2_name}...", 'INFO')
-            # --update-env 让 restart 重新读取上面注入的环境变量
+            self._log(f"[{host}] PM2 重启 {proc_name}...", 'INFO')
             restart_flag = ' --update-env' if inject_fp_env else ''
-            self._exec(client, f"{env_prefix}pm2 restart {pm2_name}{restart_flag}", timeout=30)
+            self._exec(client, f"{env_prefix}pm2 restart {proc_name}{restart_flag}", timeout=30)
         else:
-            self._log(f"[{host}] PM2 首次启动 {pm2_name}...", 'INFO')
+            self._log(f"[{host}] PM2 首次启动 {proc_name}...", 'INFO')
             self._exec(
                 client,
-                f"cd {remote_dir} && {env_prefix}pm2 start {entry_script} --name {pm2_name}",
+                f"cd {remote_dir} && {env_prefix}pm2 start {entry_script} --name {proc_name}",
                 timeout=30,
             )
         self._exec(client, "pm2 save", timeout=30)
