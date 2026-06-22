@@ -15,7 +15,26 @@
 import os
 import time
 import shutil
+import stat
 import subprocess
+
+def _rmtree_force(path):
+    """shutil.rmtree 的 Windows 兼容版：遇只读文件先取消只读再删。"""
+    if not os.path.isdir(path):
+        return
+    for root, dirs, files in os.walk(path):
+        for name in dirs + files:
+            try:
+                os.chmod(os.path.join(root, name), stat.S_IWRITE)
+            except Exception:
+                pass
+    def _onerror(func, p, _exc_info):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except Exception:
+            pass
+    shutil.rmtree(path, onerror=_onerror)
 
 from config import (
     AGENT_REMOTE_DIR, AGENT_FULL_REMOTE_DIR, AGENT_FULL_PORT,
@@ -283,7 +302,7 @@ class LocalExecutor(Executor):
                 f"如确认要覆盖，请手动清空该目录后重试。"
             )
         _log(f"清理旧部署：{target_dir}", 'INFO')
-        shutil.rmtree(target_dir, ignore_errors=True)
+        _rmtree_force(target_dir)
 
     @staticmethod
     def _backup_dbs(target_dir, _log):
@@ -321,6 +340,17 @@ class LocalExecutor(Executor):
         return _ignore
 
     # —— 进程级起停 ——
+    @staticmethod
+    def _node_exe():
+        """返回 node 可执行文件路径。Windows 上用 MSI 默认安装路径（刚装完当前进程 PATH
+        可能未刷新），避免 'node' not found；不存在时回退到 PATH 中的 'node'。"""
+        if os.name == 'nt':
+            msi = os.path.join(os.environ.get('ProgramFiles', 'C:\\Program Files'),
+                               'nodejs', 'node.exe')
+            if os.path.isfile(msi):
+                return msi
+        return 'node'
+
     def start_node(self, work_dir, entry_script, log_path):
         """后台启动 node <entry_script>（脱离当前进程），返回 pid。"""
         os.makedirs(os.path.dirname(log_path) or work_dir, exist_ok=True)
@@ -333,7 +363,7 @@ class LocalExecutor(Executor):
             kwargs['start_new_session'] = True
         # 用列表形式，正确传 web/server.js（修掉历史 ['node','web','server.js'] 的 bug）
         proc = subprocess.Popen(
-            ['node', entry_script.replace('/', os.sep)],
+            [self._node_exe(), entry_script.replace('/', os.sep)],
             cwd=work_dir, stdout=logf, stderr=subprocess.STDOUT, **kwargs,
         )
         return proc.pid

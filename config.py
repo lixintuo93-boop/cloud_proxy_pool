@@ -167,6 +167,9 @@ LOCAL_DEPLOY_DIR = _coerce_str('local_deploy_dir', os.path.join(os.path.dirname(
 # 本机伪服务器在 ssh_servers 中的固定标识
 LOCAL_SERVER_HOST = '127.0.0.1'
 
+# GitHub 仓库 URL（「从 GitHub 拉取」默认地址，可在系统配置修改）
+GITHUB_REPO_URL = _coerce_str('github_repo_url', 'https://github.com/lixintuo93-boop/gamyy-core')
+
 # 部署源解析使用的目录名（resources/ 下的子目录）
 RESOURCE_DIR_NAME = 'gamyy_core'
 

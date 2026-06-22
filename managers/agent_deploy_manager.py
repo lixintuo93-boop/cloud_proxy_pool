@@ -423,13 +423,6 @@ class AgentDeployManager:
                 self._log(f"[{server_host}] Node.js {out} 已安装，跳过", 'INFO')
                 return True
 
-        # 本地部署：只检测不自动安装（不在用户机上静默装 MSI），缺则报错引导手动安装
-        if getattr(client, 'is_local', False):
-            raise RuntimeError(
-                "本机未检测到 Node.js >= 18。请先安装 Node.js 22 LTS 后重试："
-                "https://nodejs.org/en/download"
-            )
-
         # --- 安装命令（Windows vs Linux）---
         if is_windows:
             msi_url = "https://nodejs.org/dist/v22.14.0/node-v22.14.0-x64.msi"

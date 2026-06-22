@@ -31,10 +31,29 @@ from config import (
     get_beijing_time_str, get_beijing_time_short,
 )
 import json
-import os
 import shutil
+import stat
 import zipfile
 from logger import set_gui_callback, LogLevel
+
+
+def _rmtree_force(path):
+    """shutil.rmtree 的 Windows 兼容版：遇只读文件（如 .git/objects/）先取消只读再删。"""
+    if not os.path.isdir(path):
+        return
+    for root, dirs, files in os.walk(path):
+        for name in dirs + files:
+            try:
+                os.chmod(os.path.join(root, name), stat.S_IWRITE)
+            except Exception:
+                pass
+    def _onerror(func, p, _exc_info):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except Exception:
+            pass
+    shutil.rmtree(path, onerror=_onerror)
 
 
 class BatchAddDialog(tk.Toplevel):
@@ -1437,22 +1456,27 @@ class ProxyManagerGUI:
         save_row.pack(fill=tk.X, pady=(8, 0))
         ttk.Button(save_row, text="💾 保存全部配置", command=self.save_user_settings).pack(side=tk.RIGHT, padx=5)
 
-        # 说明
-        about_frame = ttk.LabelFrame(config_frame, text="功能说明", padding="10")
-        about_frame.pack(fill=tk.X, pady=5)
+        # 部署源配置（子块）
+        deploy_cfg_frame = ttk.LabelFrame(persist_frame, text="部署源配置", padding="10")
+        deploy_cfg_frame.pack(fill=tk.X, pady=3)
 
-        about_text = (
-            "持久化配置（保存到 user_settings.json）：\n"
-            "  · 立即生效：测试URL、测试超时\n"
-            "  · 重启后生效：并发线程数、心跳间隔、Agent 部署并发\n"
-            "  · 日志目录（Agent / 流量）：作为下载时目录选择框的默认起点，\n"
-            "    改 Entry 即生效，保存仅为下次启动保留默认值\n"
-            "\n"
-            "下载日志 / DB：每次点击会弹出目录选择框，由你确认保存到哪里\n"
-            "心跳启停 / 手动发送心跳：已迁至「代理管理」批量操作区\n"
-            "测试选中：用选中的代理访问\"测试URL\"，验证代理是否能正常访问网站"
-        )
-        ttk.Label(about_frame, text=about_text, justify=tk.LEFT, wraplength=900).pack(anchor=tk.W)
+        row_github = ttk.Frame(deploy_cfg_frame)
+        row_github.pack(fill=tk.X, pady=3)
+        ttk.Label(row_github, text="GitHub 仓库 URL:", width=14, anchor=tk.W).pack(side=tk.LEFT)
+        from config import GITHUB_REPO_URL
+        self.github_repo_url_var = tk.StringVar(value=GITHUB_REPO_URL)
+        ttk.Entry(row_github, textvariable=self.github_repo_url_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        row_local = ttk.Frame(deploy_cfg_frame)
+        row_local.pack(fill=tk.X, pady=3)
+        ttk.Label(row_local, text="本机部署目录:", width=14, anchor=tk.W).pack(side=tk.LEFT)
+        from config import LOCAL_DEPLOY_DIR
+        self.local_deploy_dir_var = tk.StringVar(value=LOCAL_DEPLOY_DIR)
+        ttk.Entry(row_local, textvariable=self.local_deploy_dir_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(
+            row_local, text="📂 浏览…",
+            command=lambda v=self.local_deploy_dir_var: self._browse_directory(v),
+        ).pack(side=tk.LEFT, padx=5)
 
     def _browse_directory(self, var):
         """通用目录选择：弹 askdirectory 并把选中路径写回 StringVar。"""
@@ -1482,6 +1506,8 @@ class ProxyManagerGUI:
 
         agent_log_save_dir = self.agent_log_save_dir_var.get().strip()
         traffic_log_save_dir = self.traffic_log_save_dir_var.get().strip()
+        github_repo_url = self.github_repo_url_var.get().strip()
+        local_deploy_dir = self.local_deploy_dir_var.get().strip()
 
         # 校验
         if not test_url or not (test_url.startswith("http://") or test_url.startswith("https://")):
@@ -1505,6 +1531,12 @@ class ProxyManagerGUI:
         if not traffic_log_save_dir:
             messagebox.showerror("错误", "流量日志目录不能为空")
             return
+        if not github_repo_url or not (github_repo_url.startswith("http://") or github_repo_url.startswith("https://")):
+            messagebox.showerror("错误", "GitHub URL 必须以 http:// 或 https:// 开头")
+            return
+        if not local_deploy_dir:
+            messagebox.showerror("错误", "本机部署目录不能为空")
+            return
 
         settings = {
             "proxy_test_url": test_url,
@@ -1514,6 +1546,8 @@ class ProxyManagerGUI:
             "agent_deploy_workers": agent_deploy_workers,
             "agent_log_save_dir": agent_log_save_dir,
             "traffic_log_save_dir": traffic_log_save_dir,
+            "github_repo_url": github_repo_url,
+            "local_deploy_dir": local_deploy_dir,
         }
 
         # 与 config.py 的 loader 用同一份路径（_app_root 决定的 EXE 同目录 / 项目目录）
@@ -1527,10 +1561,19 @@ class ProxyManagerGUI:
             messagebox.showerror("错误", f"写入配置文件失败: {e}")
             return
 
+        # 同步更新 config 模块的运行时值（让 LocalExecutor.resolve_dir 等立即生效）
+        try:
+            import config as _cfg
+            _cfg._S.update(settings)
+            _cfg.LOCAL_DEPLOY_DIR = local_deploy_dir
+            _cfg.GITHUB_REPO_URL = github_repo_url
+        except Exception:
+            pass
+
         messagebox.showinfo(
             "已保存",
             "配置已保存到 user_settings.json\n\n"
-            "立即生效：测试URL、测试超时\n"
+            "立即生效：测试URL、测试超时、GitHub URL、本机部署目录\n"
             "重启后生效：并发线程数、心跳间隔、Agent 部署并发\n\n"
             "Agent / 流量日志目录：作为下载时弹出对话框的默认起点；\n"
             "修改 Entry 即生效，本次保存仅为下次启动保留默认值。"
@@ -2769,6 +2812,35 @@ class ProxyManagerGUI:
             messagebox.showinfo("提示", "没有需要部署的服务器")
             return
 
+        # 如果选中了本机行，先让用户选择本机部署目录
+        local_servers = self.agent_manager.get_servers_by_ids(deploy_ids)
+        if any(s.get('is_local') for s in local_servers):
+            from config import LOCAL_DEPLOY_DIR
+            chosen = filedialog.askdirectory(
+                title='选择本机部署目录（会在其下写入 gamyy-core 文件）',
+                initialdir=LOCAL_DEPLOY_DIR if os.path.isdir(os.path.dirname(LOCAL_DEPLOY_DIR)) else os.path.expanduser('~'),
+            )
+            if not chosen:
+                return
+            chosen = os.path.normpath(chosen)
+            # 同步更新 config 运行时值 + user_settings.json
+            try:
+                import config as _cfg
+                _cfg._S['local_deploy_dir'] = chosen
+                _cfg.LOCAL_DEPLOY_DIR = chosen
+                sf = _cfg._SETTINGS_FILE
+                prev = {}
+                if os.path.isfile(sf):
+                    with open(sf, 'r', encoding='utf-8') as f:
+                        prev = json.load(f)
+                prev['local_deploy_dir'] = chosen
+                with open(sf + '.tmp', 'w', encoding='utf-8') as f:
+                    json.dump(prev, f, indent=2, ensure_ascii=False)
+                os.replace(sf + '.tmp', sf)
+                self._agent_log(f"本机部署目录: {chosen}", 'INFO')
+            except Exception:
+                pass
+
         for sid in deploy_ids:
             self._agent_set_row_op_status(sid, '等待中...')
 
@@ -2850,7 +2922,7 @@ class ProxyManagerGUI:
             try:
                 # 清理已有 dst（保证覆盖一致）
                 if os.path.isdir(dst):
-                    shutil.rmtree(dst)
+                    _rmtree_force(dst)
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.copytree(src, dst, ignore=_ignore)
                 self._agent_log(f"同步完成：{src} → {dst}", 'SUCCESS')
@@ -2862,58 +2934,118 @@ class ProxyManagerGUI:
         self.run_async(do_sync)
 
     def _agent_github_pull(self):
-        """从 GitHub 拉取 gamyy-core 最新代码，写入统一的部署源目标。
-        目标已有 .git → git pull 增量更新；否则 → 清空后 git clone。"""
+        """从 GitHub 下载 zip 包，解压到统一的部署源目标（不依赖 git）。
+        弹窗让用户确认/修改 URL，默认取 user_settings 保存的值。"""
         dst = os.path.join(_app_root(), 'resources', RESOURCE_DIR_NAME)
-        repo_url = 'https://github.com/lixintuo93-boop/gamyy-core'
+        from config import GITHUB_REPO_URL
+
+        # 弹窗确认 URL
+        dlg = tk.Toplevel(self.root)
+        dlg.title("从 GitHub 拉取")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        frm = ttk.Frame(dlg, padding="10")
+        frm.pack()
+        ttk.Label(frm, text="GitHub 仓库 URL（默认 master 分支打包下载）:").pack(anchor=tk.W)
+
+        url_var = tk.StringVar(value=GITHUB_REPO_URL)
+        entry = ttk.Entry(frm, textvariable=url_var, width=60)
+        entry.pack(fill=tk.X, pady=(5, 10))
+        entry.selection_range(0, tk.END)
+        entry.focus()
+
+        ttk.Label(frm, text=f"将下载 zip 并写入: {dst}", foreground="gray").pack(anchor=tk.W)
+
+        btn = ttk.Frame(frm)
+        btn.pack(fill=tk.X, pady=(10, 0))
+        result = tk.BooleanVar(value=False)
+
+        def go():
+            if not url_var.get().strip().startswith(('http://', 'https://')):
+                messagebox.showerror("错误", "URL 必须以 http:// 或 https:// 开头", parent=dlg)
+                return
+            result.set(True)
+            dlg.destroy()
+
+        ttk.Button(btn, text="确认拉取", command=go).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn, text="取消", command=dlg.destroy).pack(side=tk.RIGHT)
+        dlg.wait_window()
+
+        if not result.get():
+            return
+        repo_url = url_var.get().strip()
+
+        # 记住新 URL
+        try:
+            import config as _cfg
+            _cfg._S['github_repo_url'] = repo_url
+            _cfg.GITHUB_REPO_URL = repo_url
+            settings_file = _cfg._SETTINGS_FILE
+            prev = {}
+            if os.path.isfile(settings_file):
+                with open(settings_file, 'r', encoding='utf-8') as f:
+                    prev = json.load(f)
+            prev['github_repo_url'] = repo_url
+            with open(settings_file + '.tmp', 'w', encoding='utf-8') as f:
+                json.dump(prev, f, indent=2, ensure_ascii=False)
+            os.replace(settings_file + '.tmp', settings_file)
+        except Exception:
+            pass
 
         def do_pull():
-            import subprocess
+            import urllib.request, io
             try:
-                # 检测 git 是否可用
-                try:
-                    subprocess.run(['git', '--version'], capture_output=True, timeout=5, check=True)
-                except Exception:
-                    raise RuntimeError(
-                        "未检测到 Git，请先安装：\n"
-                        "  https://git-scm.com/download/win  (Windows)\n"
-                        "  apt-get install git / brew install git  (Linux/macOS)"
-                    )
+                # 拼接 zip 下载 URL: https://.../archive/refs/heads/master.zip
+                zip_url = repo_url.rstrip('/') + '/archive/refs/heads/master.zip'
+                self._agent_log(f"下载 {zip_url} ...", 'INFO')
+                self._agent_set_progress("GitHub 拉取：下载中...")
 
-                is_git = os.path.isdir(os.path.join(dst, '.git'))
-                if is_git:
-                    # 增量更新
-                    self._agent_log("git pull 更新中...", 'INFO')
-                    result = subprocess.run(
-                        ['git', 'pull', '--ff-only'],
-                        cwd=dst, capture_output=True, text=True, timeout=60,
-                    )
-                    if result.returncode != 0:
-                        raise RuntimeError(f"git pull 失败:\n{result.stderr[:500]}")
-                    self._agent_log(f"git pull 完成\n{result.stdout.strip()[:300]}", 'SUCCESS')
+                req = urllib.request.Request(zip_url, headers={'User-Agent': 'cloud-proxy-pool'})
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    data = resp.read()
+
+                self._agent_set_progress("GitHub 拉取：解压中...")
+                # 清空旧源
+                if os.path.isdir(dst):
+                    _rmtree_force(dst)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+
+                # 解压到临时目录
+                tmp_dst = dst + '.tmp'
+                if os.path.isdir(tmp_dst):
+                    _rmtree_force(tmp_dst)
+                os.makedirs(tmp_dst, exist_ok=True)
+
+                with zipfile.ZipFile(io.BytesIO(data), 'r') as zf:
+                    zf.extractall(tmp_dst)
+
+                # GitHub zip 顶层是个 gamyy-core-master 单一目录，自动剥一层
+                entries = os.listdir(tmp_dst)
+                if len(entries) == 1 and os.path.isdir(os.path.join(tmp_dst, entries[0])):
+                    inner = os.path.join(tmp_dst, entries[0])
+                    if os.path.isfile(os.path.join(inner, 'agent', 'server.js')):
+                        shutil.move(inner, dst)
+                        _rmtree_force(tmp_dst)
+                    else:
+                        raise RuntimeError("zip 内目录缺 agent/server.js，不像 gamyy-core")
                 else:
-                    # 清空旧内容（可能是 zip 导入 / 外部同步留下的），重新 clone
-                    if os.path.isdir(dst):
-                        self._agent_log(f"清空旧源: {dst}", 'INFO')
-                        shutil.rmtree(dst)
-                    os.makedirs(os.path.dirname(dst), exist_ok=True)
-                    self._agent_log(f"git clone {repo_url} ...", 'INFO')
-                    result = subprocess.run(
-                        ['git', 'clone', '--depth', '1', repo_url, dst],
-                        capture_output=True, text=True, timeout=120,
-                    )
-                    if result.returncode != 0:
-                        raise RuntimeError(f"git clone 失败:\n{result.stderr[:500]}")
-                    self._agent_log("git clone 完成", 'SUCCESS')
+                    raise RuntimeError("zip 内容结构异常（预期单一顶层目录）")
 
-                # 校验
-                if not os.path.isfile(os.path.join(dst, 'agent', 'server.js')):
-                    raise RuntimeError("拉取完成但目录不像 gamyy-core（缺 agent/server.js）")
+                self._agent_log(f"GitHub 拉取完成 → {dst}", 'SUCCESS')
                 self.root.after(0, self._agent_refresh_source_status)
 
             except Exception as e:
                 self._agent_log(f"GitHub 拉取失败: {e}", 'ERROR')
+                try:
+                    if os.path.isdir(dst + '.tmp'):
+                        _rmtree_force(dst + '.tmp')
+                except Exception:
+                    pass
                 self.root.after(0, lambda: messagebox.showerror("拉取失败", str(e)))
+            finally:
+                self._agent_set_progress("")
 
         self.run_async(do_pull)
 
@@ -2933,7 +3065,7 @@ class ProxyManagerGUI:
                 # 解压到 tmp 校验后再 swap
                 tmp_dst = dst + '.tmp'
                 if os.path.isdir(tmp_dst):
-                    shutil.rmtree(tmp_dst)
+                    _rmtree_force(tmp_dst)
                 os.makedirs(tmp_dst, exist_ok=True)
 
                 with zipfile.ZipFile(zip_path, 'r') as zf:
@@ -2946,15 +3078,15 @@ class ProxyManagerGUI:
                     if os.path.isfile(os.path.join(inner, 'agent', 'server.js')):
                         # 把内层目录直接当成 dst
                         if os.path.isdir(dst):
-                            shutil.rmtree(dst)
+                            _rmtree_force(dst)
                         shutil.move(inner, dst)
-                        shutil.rmtree(tmp_dst)
+                        _rmtree_force(tmp_dst)
                     else:
                         raise RuntimeError("zip 内目录缺 agent/server.js")
                 elif os.path.isfile(os.path.join(tmp_dst, 'agent', 'server.js')):
                     # zip 顶层就是项目根
                     if os.path.isdir(dst):
-                        shutil.rmtree(dst)
+                        _rmtree_force(dst)
                     os.rename(tmp_dst, dst)
                 else:
                     raise RuntimeError("zip 内容不像 gamyy-core 项目（找不到 agent/server.js）")
@@ -2966,7 +3098,7 @@ class ProxyManagerGUI:
                 # 清理 tmp
                 try:
                     if os.path.isdir(dst + '.tmp'):
-                        shutil.rmtree(dst + '.tmp')
+                        _rmtree_force(dst + '.tmp')
                 except Exception:
                     pass
                 self.root.after(0, lambda: messagebox.showerror("导入失败", str(e)))
