@@ -163,7 +163,7 @@ AGENT_FULL_PORT       = 3000                   # web/server.js 默认端口
 # 目录【固定】不让用户在 GUI 里选盘符（历史上选 E:\ 导致整盘被删）；
 # 高级用户可在 user_settings.json 写 "local_deploy_dir" 覆盖。
 # 默认派生自 _app_root()：开发态=项目目录/local_deploy/gamyy-core；打包后=EXE 同目录下。
-LOCAL_DEPLOY_DIR = _coerce_str('local_deploy_dir', os.path.join(os.path.dirname(_app_root()), 'gamyy-core'))
+LOCAL_DEPLOY_DIR = _coerce_str('local_deploy_dir', os.path.dirname(_app_root()))
 # 本机伪服务器在 ssh_servers 中的固定标识
 LOCAL_SERVER_HOST = '127.0.0.1'
 

@@ -1451,11 +1451,6 @@ class ProxyManagerGUI:
             command=lambda v=self.traffic_log_save_dir_var: self._browse_directory(v),
         ).pack(side=tk.LEFT, padx=5)
 
-        # 保存按钮放在外层 LabelFrame 底部右侧——视觉上明显隶属整个"持久化配置"块
-        save_row = ttk.Frame(persist_frame)
-        save_row.pack(fill=tk.X, pady=(8, 0))
-        ttk.Button(save_row, text="💾 保存全部配置", command=self.save_user_settings).pack(side=tk.RIGHT, padx=5)
-
         # 部署源配置（子块）
         deploy_cfg_frame = ttk.LabelFrame(persist_frame, text="部署源配置", padding="10")
         deploy_cfg_frame.pack(fill=tk.X, pady=3)
@@ -1477,6 +1472,11 @@ class ProxyManagerGUI:
             row_local, text="📂 浏览…",
             command=lambda v=self.local_deploy_dir_var: self._browse_directory(v),
         ).pack(side=tk.LEFT, padx=5)
+
+        # 保存按钮放在外层 LabelFrame 底部右侧——视觉上明显隶属整个"持久化配置"块
+        save_row = ttk.Frame(persist_frame)
+        save_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(save_row, text="💾 保存全部配置", command=self.save_user_settings).pack(side=tk.RIGHT, padx=5)
 
     def _browse_directory(self, var):
         """通用目录选择：弹 askdirectory 并把选中路径写回 StringVar。"""
@@ -2838,6 +2838,11 @@ class ProxyManagerGUI:
                     json.dump(prev, f, indent=2, ensure_ascii=False)
                 os.replace(sf + '.tmp', sf)
                 self._agent_log(f"本机部署目录: {chosen}", 'INFO')
+                # 同步更新系统配置页的输入框
+                try:
+                    self.local_deploy_dir_var.set(chosen)
+                except Exception:
+                    pass
             except Exception:
                 pass
 

@@ -228,8 +228,12 @@ class LocalExecutor(Executor):
         return self._os
 
     def resolve_dir(self, mode='agent'):
-        # 本地只做完整部署；目录固定（可经 user_settings.json 覆盖）
-        return LOCAL_DEPLOY_DIR
+        # 本地只做完整部署；目录为用户选的父目录 + gamyy-core 子目录
+        import config
+        parent = config.LOCAL_DEPLOY_DIR
+        if os.path.basename(os.path.normpath(parent)) == 'gamyy-core':
+            return parent  # 兼容旧配置
+        return os.path.join(parent, 'gamyy-core')
 
     def mkdirs(self, remote_path):
         os.makedirs(remote_path, exist_ok=True)
