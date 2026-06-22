@@ -13,7 +13,6 @@
             <el-tag v-if="row.name === '默认配置'" size="small" type="warning" style="margin-left:6px;font-size:11px">默认</el-tag>
           </div>
           <div v-if="row.description" class="tmpl-card-desc">{{ row.description }}</div>
-          <div class="tmpl-card-desc" style="margin-top:2px">指纹：{{ fpLabel(row.fingerprint_config?.name) }}</div>
         </div>
 
         <div class="tmpl-card-body">
@@ -32,7 +31,7 @@
               <span class="v" :style="row.channel_build_overrides?.autoCloseExcess?.enabled ? 'color:#67c23a' : 'color:#c0c4cc'">
                 {{ row.channel_build_overrides?.autoCloseExcess?.enabled ? '✓' : '✗' }}
               </span>
-              <span class="k">最大</span><span class="v">{{ fmtMaxChannels(row.channel_build_overrides?.maxSuccessChannels) }}</span>
+              <span class="k">存活上限</span><span class="v">{{ fmtMaxChannels(row.channel_build_overrides?.maxSuccessChannels) }}</span>
             </div>
           </div>
 
@@ -121,9 +120,9 @@
                 <el-radio value="random">随机</el-radio>
               </el-radio-group>
             </el-form-item>
-            <el-form-item label="最大成功通道数">
+            <el-form-item label="最大存活通道数">
               <el-input-number v-model="form.channelCfg.maxSuccessChannels" :min="0" :step="1" />
-              <span class="tmpl-hint">0 = 不限</span>
+              <span class="tmpl-hint">0 = 不限，达到上限后跳过创建，通道死亡后后续时间槽自动补位</span>
             </el-form-item>
             <el-divider>早停策略</el-divider>
             <el-form-item label="启用早停">
@@ -330,31 +329,6 @@
               </el-form-item>
             </template>
           </el-tab-pane>
-
-          <el-tab-pane label="TLS指纹">
-            <el-form-item label="TLS 指纹">
-              <el-select v-model="form.fingerprint_name" style="width:300px">
-                <el-option
-                  v-for="fp in fingerprints"
-                  :key="fp.name"
-                  :value="fp.name"
-                  :label="fp.label + (fp.isDefault ? '（默认）' : '')"
-                />
-              </el-select>
-            </el-form-item>
-            <el-form-item v-if="selectedFp" label=" " label-width="0">
-              <div style="width:100%;color:#606266;font-size:12px;line-height:1.9">
-                <div>来源：{{ selectedFp.source || '—' }}</div>
-                <div>模式：{{ selectedFp.mode }} ｜ ALPN：{{ (selectedFp.alpn || []).join(', ') || '—' }}</div>
-                <div style="font-family:monospace">JA3：{{ selectedFp.ja3 || '（每连随机/见 JA4）' }}</div>
-                <div style="font-family:monospace">JA4：{{ selectedFp.ja4 || '—' }}</div>
-                <div style="color:#909399;margin-top:8px">
-                  指纹由 fp-sidecar 施加。需在运行 gamyy-core 时设置环境变量 FP_SIDECAR_ADDR（如 127.0.0.1:8788）并启动 sidecar 才生效；
-                  未设置则走 Node 原生 TLS（指纹无效）。account 走 HTTP/1.1，建议用 android_app。
-                </div>
-              </div>
-            </el-form-item>
-          </el-tab-pane>
         </el-tabs>
       </el-form>
       <template #footer>
@@ -366,13 +340,13 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, onMounted } from 'vue'
 import { Plus } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import MainLayout from '@/layout/MainLayout.vue'
 import TimeInput from '@/components/TimeInput.vue'
 import TargetHostsEditor from '@/components/TargetHostsEditor.vue'
-import { getProxyTemplates, createProxyTemplate, updateProxyTemplate, deleteProxyTemplate, getSystemConfig, getHeartbeatEndpoints, getFingerprints } from '@/api'
+import { getProxyTemplates, createProxyTemplate, updateProxyTemplate, deleteProxyTemplate, getSystemConfig, getHeartbeatEndpoints } from '@/api'
 import { isTimeString, isValidMaxChannels } from '@/utils/validate'
 
 const loading = ref(false)
@@ -383,13 +357,6 @@ const editing = ref(null)
 const lockMode = ref('immediate')
 const newDoctorCode = ref('')
 const heartbeatEndpoints = ref([])
-const fingerprints = ref([])
-const selectedFp = computed(() => fingerprints.value.find(f => f.name === form.fingerprint_name) || null)
-function fpLabel(name) {
-  const n = name || 'android_app'
-  const fp = fingerprints.value.find(f => f.name === n)
-  return fp ? fp.label : n
-}
 
 function toggleEndpoint(id, checked) {
   const set = new Set(form.keepalive_business_endpoints)
@@ -432,8 +399,6 @@ const form = reactive({
   keepalive_business_endpoints: [],
   direct_keepalive_enabled: 0,
   heartbeat_timeout: 300000,
-  // TLS 指纹（按名引用 services/fingerprints.js 注册表）
-  fingerprint_name: 'android_app',
 })
 
 function addDoctorCode() {
@@ -488,11 +453,10 @@ function fmtKaEndpoints(row) {
 async function loadAll() {
   loading.value = true
   try {
-    const [t, sys, ep, fp] = await Promise.all([getProxyTemplates(), getSystemConfig(), getHeartbeatEndpoints(), getFingerprints()])
+    const [t, sys, ep] = await Promise.all([getProxyTemplates(), getSystemConfig(), getHeartbeatEndpoints()])
     templates.value = t.data
     systemHosts.value = Array.isArray(sys.data?.target_hosts) ? sys.data.target_hosts : []
     heartbeatEndpoints.value = Array.isArray(ep.data) ? ep.data : []
-    fingerprints.value = Array.isArray(fp.data?.list) ? fp.data.list : []
   } finally { loading.value = false }
 }
 
@@ -526,7 +490,6 @@ function openTmpl(row = null) {
     keepalive_business_endpoints: Array.isArray(src?.keepalive_business_endpoints) ? [...src.keepalive_business_endpoints] : [],
     direct_keepalive_enabled: src?.direct_keepalive_enabled ?? 0,
     heartbeat_timeout: src?.heartbeat_timeout ?? 300000,
-    fingerprint_name: parseField(src?.fingerprint_config)?.name || 'android_app',
   })
   Object.assign(form.reuseChannel, { enabled: false, minInterval: 1000, reuseOnTimeout: false, reuseOnError: false, ...rc })
   Object.assign(form.lockCfg, { reservedChannels: 0, lockStartTime: '', firstLockDelayMs: 0, windowTime: 20000, minInterval: 250, directRequestOnNoChannel: false, submitSignStrategy: 'rotate', ...lk })
@@ -594,7 +557,6 @@ async function saveTmpl() {
     keepalive_business_endpoints: [...form.keepalive_business_endpoints],
     direct_keepalive_enabled: form.direct_keepalive_enabled,
     heartbeat_timeout: form.heartbeat_timeout,
-    fingerprint_config: { name: form.fingerprint_name },
   }
   if (editing.value?.id) await updateProxyTemplate(editing.value.id, payload)
   else await createProxyTemplate(payload)

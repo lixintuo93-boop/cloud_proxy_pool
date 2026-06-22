@@ -860,9 +860,9 @@
                 <el-radio value="random">随机</el-radio>
               </el-radio-group>
             </el-form-item>
-            <el-form-item label="最大成功通道数">
+            <el-form-item label="最大存活通道数">
               <el-input-number v-model="proxyOverrideForm.maxSuccessChannels" :min="0" :step="1" controls-position="right" style="width:150px" />
-              <span class="proxy-cfg-hint">0 = 不限</span>
+              <span class="proxy-cfg-hint">0 = 不限，达到上限后跳过创建，通道死亡后后续时间槽自动补位</span>
             </el-form-item>
             <el-divider>早停策略</el-divider>
             <el-form-item label="启用早停">
@@ -1084,28 +1084,6 @@
               </el-form-item>
             </template>
           </el-tab-pane>
-
-          <el-tab-pane label="TLS指纹">
-            <el-form-item label="TLS 指纹">
-              <el-select v-model="proxyOverrideForm.fingerprint_name" style="width:300px">
-                <el-option
-                  v-for="fp in fingerprints"
-                  :key="fp.name"
-                  :value="fp.name"
-                  :label="fp.label + (fp.isDefault ? '（默认）' : '')"
-                />
-              </el-select>
-            </el-form-item>
-            <el-form-item v-if="proxyOverrideSelectedFp" label=" " label-width="0">
-              <div style="width:100%;color:#606266;font-size:12px;line-height:1.9">
-                <div>来源：{{ proxyOverrideSelectedFp.source || '—' }}</div>
-                <div>模式：{{ proxyOverrideSelectedFp.mode }} ｜ ALPN：{{ (proxyOverrideSelectedFp.alpn || []).join(', ') || '—' }}</div>
-                <div style="font-family:monospace">JA3：{{ proxyOverrideSelectedFp.ja3 || '（每连随机/见 JA4）' }}</div>
-                <div style="font-family:monospace">JA4：{{ proxyOverrideSelectedFp.ja4 || '—' }}</div>
-                <div style="color:#909399;margin-top:8px">需运行 fp-sidecar 并设 FP_SIDECAR_ADDR 才生效；否则走原生 TLS。</div>
-              </div>
-            </el-form-item>
-          </el-tab-pane>
         </el-tabs>
       </el-form>
       <template #footer>
@@ -1130,7 +1108,7 @@ import {
   getTasks, createTask, deleteTask, startTask, stopTask, getRunningTasks,
   getDoctors, getAccountPatients, getTaskProxies, getTaskProxyStats,
   updateProxyConfig,
-  getProxyTemplates, getSystemConfig, getHeartbeatEndpoints, getFingerprints,
+  getProxyTemplates, getSystemConfig, getHeartbeatEndpoints,
   executeAccountOperation, getAccountSourceRecords, getAccountMessages, getAccountRequestLogs,
   generateAccounts, addManualAccount,
   generatePatientInfo,
@@ -1231,9 +1209,6 @@ const proxyOverrideForm     = reactive({
   keepalive_business_endpoints: [],
   direct_keepalive_enabled: 0,
   heartbeat_timeout: 300000,
-
-  // ── TLS 指纹 ───────────────────────────────────────────────────────
-  fingerprint_name: 'android_app',
 })
 // 锁号开始时间的 radio 形态：'immediate' / 'scheduled'
 const proxyOverrideLockMode = ref('immediate')
@@ -1243,9 +1218,6 @@ const proxyOverrideSaving   = ref(false)
 const proxyOverrideLoading  = ref(false)
 // 心跳业务端点元数据（onMounted 拉取）
 const heartbeatEndpoints = ref([])
-// TLS 指纹注册表（首次打开代理覆盖弹窗时拉取）
-const fingerprints = ref([])
-const proxyOverrideSelectedFp = computed(() => fingerprints.value.find(f => f.name === proxyOverrideForm.fingerprint_name) || null)
 function toggleProxyEndpoint(id, checked) {
   const set = new Set(proxyOverrideForm.keepalive_business_endpoints)
   if (checked) set.add(id); else set.delete(id)
@@ -1447,9 +1419,6 @@ function fillFormFromProxy(proxy) {
   proxyOverrideForm.keepalive_business_endpoints = proxyEndpoints && proxyEndpoints.length ? [...proxyEndpoints] : [...effEndpoints]
   proxyOverrideForm.direct_keepalive_enabled = pickNum(proxy.direct_keepalive_enabled, eff.direct_keepalive_enabled, 0)
   proxyOverrideForm.heartbeat_timeout        = pickNum(proxy.heartbeat_timeout, eff.heartbeat_timeout, 300000)
-  // TLS 指纹：代理覆盖 fingerprint_config.name → 有效指纹 name → 默认 android_app
-  proxyOverrideForm.fingerprint_name = (proxy.fingerprint_config && proxy.fingerprint_config.name)
-    || (eff.fingerprint && eff.fingerprint.name) || 'android_app'
 
   // 锁号开始时间 radio：有非空字符串=指定，空=立即
   proxyOverrideLockMode.value = proxyOverrideForm.lock_start_time ? 'scheduled' : 'immediate'
@@ -1472,9 +1441,6 @@ async function openProxyOverride(taskId, proxy) {
       }
     }
   } catch (_) { /* 离线/超时就退化用缓存 */ }
-  if (!fingerprints.value.length) {
-    try { const fp = await getFingerprints(); fingerprints.value = Array.isArray(fp.data?.list) ? fp.data.list : [] } catch (_) {}
-  }
   fillFormFromProxy(proxy)
   proxyOverrideDialog.value = true
   proxyOverrideLoading.value = false
@@ -1590,8 +1556,6 @@ async function saveProxyOverride() {
       keepalive_business_endpoints: [...proxyOverrideForm.keepalive_business_endpoints],
       direct_keepalive_enabled:     proxyOverrideForm.direct_keepalive_enabled,
       heartbeat_timeout:            proxyOverrideForm.heartbeat_timeout,
-      // TLS 指纹（代理级覆盖）
-      fingerprint_config:           { name: proxyOverrideForm.fingerprint_name },
     })
     const r = await getTaskProxies(taskId)
     taskProxiesMap[taskId] = r.data

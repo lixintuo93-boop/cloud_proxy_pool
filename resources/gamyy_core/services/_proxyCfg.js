@@ -20,9 +20,4 @@ function channelPhase1(_taskConfig, proxyConfig) {
   return pickCfg(_taskConfig, proxyConfig).channelBuildPhase1 || {};
 }
 
-// TLS 指纹配置（代理级）。返回已解析的完整指纹对象（见 services/fingerprints.js）。
-function fingerprint(_taskConfig, proxyConfig) {
-  return pickCfg(_taskConfig, proxyConfig).fingerprint || {};
-}
-
-module.exports = { pickCfg, checkReq, lockGlobal, channelPhase1, fingerprint };
+module.exports = { pickCfg, checkReq, lockGlobal, channelPhase1 };

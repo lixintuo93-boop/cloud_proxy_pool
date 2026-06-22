@@ -2,7 +2,6 @@
 const tls = require('tls');
 const crypto = require('crypto');
 const { SocksClient } = require('socks');
-const sidecar = require('./sidecarClient');
 
 const ChannelLog = require('../models/channelLog');
 const CryptoUtils = require('../crypto/cryptoUtils');
@@ -629,12 +628,6 @@ class ConnectionChannel {
   }
 
   async attemptConnect() {
-    // sidecar 模式（设了 FP_SIDECAR_ADDR）：经 fp-sidecar 隧道，由其用代理层指定的 TLS 指纹握手。
-    // 隧道内走明文，sidecar 负责上游 SOCKS5 + uTLS；通道的多路复用/心跳/响应解析全不变。
-    if (sidecar.SIDECAR_ADDR) {
-      return this._attemptConnectViaSidecar();
-    }
-
     let rawTcpSocket;
 
     if (this.proxyConfig.proxyType === 'direct') {
@@ -712,35 +705,6 @@ class ConnectionChannel {
         reject(error);
       });
     });
-  }
-
-  // sidecar 模式建连：经 fp-sidecar 的 CONNECT 隧道，this.socket = 明文隧道 socket
-  // （sidecar 已完成上游 SOCKS5 + uTLS 指纹握手）。后处理与 secureConnect 分支保持一致。
-  async _attemptConnectViaSidecar() {
-    const target = `${this.targetHost}:${this.targetPort}`;
-    const fpHeader = sidecar.buildFingerprintHeader(
-      this.proxyConfig.cfg && this.proxyConfig.cfg.fingerprint,
-      this.sni || this.targetHost
-    );
-    const upstream = this.proxyConfig.proxyType === 'direct' ? '' : sidecar.buildSocksUrl(this.proxyConfig);
-
-    const sock = await sidecar.establishTunnel(target, fpHeader, upstream, this.config.timeout.connectTimeout);
-
-    this.rawTcpSocket = sock;
-    this.socket = sock;
-    this.socket.setMaxListeners(CONNECTION_CHANNEL_CONSTANTS.MAX_LISTENERS);
-
-    this.isConnected = true;
-    this.isConnecting = false;
-    this.connectedAt = Date.now();
-    this.lastActiveAt = this.connectedAt;
-
-    this.bindDataListener();
-    this.startHeartbeat();
-
-    await this.saveChannelLog('connected');
-    if (this.onConnected) this.onConnected();
-    return this;
   }
 
   getStatusDescription() {

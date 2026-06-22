@@ -48,9 +48,6 @@ export const createProxyTemplate = (data)     => http.post('/proxy-templates', d
 export const updateProxyTemplate = (id, data) => http.put(`/proxy-templates/${id}`, data)
 export const deleteProxyTemplate = (id)       => http.delete(`/proxy-templates/${id}`)
 
-// ── TLS 指纹 ──────────────────────────────────────────────
-export const getFingerprints     = ()         => http.get('/fingerprints')
-
 // ── 代理池 ────────────────────────────────────────────────
 export const getProxies          = (params)   => http.get('/proxies', { params })
 export const syncProxies         = ()         => http.post('/proxies/sync')

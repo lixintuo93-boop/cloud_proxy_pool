@@ -208,7 +208,6 @@ account (账号)
 | 云端 agent 入口 | [`agent/server.js`](./agent/server.js) |
 | 查号 / 锁号业务 | [`services/SchedulerService.js`](./services/) |
 | 账号操作(登录 / 患者 / 注册) | [`account/`](./account/) |
-| TLS 指纹(account 查号/锁号) | [`TLS_FINGERPRINT.md`](./TLS_FINGERPRINT.md),[`services/fingerprints.js`](./services/fingerprints.js),[`fp-sidecar/`](./fp-sidecar/) |
 | 前端批量启动 | [`frontend/src/views/Accounts.vue`](./frontend/src/views/Accounts.vue) `runBatchStartTasks` |
 | 部署运维 | [`DEPLOY.md`](./DEPLOY.md),[`deploy.sh`](./deploy.sh) |
 

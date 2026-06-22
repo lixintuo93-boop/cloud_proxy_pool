@@ -205,18 +205,6 @@ function runMigrations(db) {
     const type = col === 'keepalive_request_type' || col === 'keepalive_business_endpoints' ? 'TEXT' : 'INTEGER';
     if (!proxyHbCols.includes(col)) db.prepare(`ALTER TABLE proxies ADD COLUMN ${col} ${type}`).run();
   }
-
-  // ===== TLS 指纹配置（代理级）=====
-  // 模板列：NOT NULL，默认 = 抓包的 Android App 指纹（见 services/fingerprints.js）。
-  // proxies 覆盖列：可空（null = 跟随模板），实现「不同代理不同指纹」。
-  const tmplFpCols = db.prepare("PRAGMA table_info(proxy_templates)").all().map(c => c.name);
-  if (!tmplFpCols.includes('fingerprint_config')) {
-    db.prepare(`ALTER TABLE proxy_templates ADD COLUMN fingerprint_config TEXT NOT NULL DEFAULT '{"name":"android_app"}'`).run();
-  }
-  const proxyFpCols = db.prepare("PRAGMA table_info(proxies)").all().map(c => c.name);
-  if (!proxyFpCols.includes('fingerprint_config')) {
-    db.prepare("ALTER TABLE proxies ADD COLUMN fingerprint_config TEXT DEFAULT NULL").run();
-  }
   // 3) 一次性：把现存 system_config 心跳值迁移到「默认配置」模板（保留升级前行为），再 DROP 系统层列
   const sysHbCols = db.prepare("PRAGMA table_info(system_config)").all().map(c => c.name);
   if (sysHbCols.includes('keepalive_enabled')) {

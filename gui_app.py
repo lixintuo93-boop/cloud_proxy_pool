@@ -2386,9 +2386,9 @@ class ProxyManagerGUI:
         ttk.Label(src_frame, textvariable=self.agent_source_status_var,
                   foreground="darkblue").pack(side=tk.LEFT, padx=5)
 
+        ttk.Button(src_frame, text="📦 从 GitHub 拉取", command=self._agent_github_pull).pack(side=tk.RIGHT, padx=2)
         ttk.Button(src_frame, text="📥 从外部同步", command=self._agent_sync_source).pack(side=tk.RIGHT, padx=2)
         ttk.Button(src_frame, text="📤 导入 zip", command=self._agent_import_zip).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(src_frame, text="♻️ 重置导入版", command=self._agent_reset_imported).pack(side=tk.RIGHT, padx=2)
         ttk.Button(src_frame, text="🔍 刷新状态", command=self._agent_refresh_source_status).pack(side=tk.RIGHT, padx=2)
 
         # ── 工具栏 ──────────────────────────────────────────
@@ -2416,7 +2416,6 @@ class ProxyManagerGUI:
         ttk.Button(toolbar, text="💾 下载日志DB", command=self._agent_batch_download_db).pack(side=tk.LEFT, padx=2)
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
-        ttk.Button(toolbar, text="🖥 本地部署", command=self._local_deploy).pack(side=tk.LEFT, padx=2)
 
         self.agent_progress_label = ttk.Label(toolbar, text="", foreground="gray")
         self.agent_progress_label.pack(side=tk.RIGHT, padx=10)
@@ -2464,9 +2463,9 @@ class ProxyManagerGUI:
     _MODE_LABEL     = {'agent': '🔹 Agent', 'full': '🔶 完整'}
 
     def _format_deploy_mode(self, raw_mode):
-        """把 'agent,full' 格式化为显示文本 '🔹 Agent + 🔶 完整'"""
-        if not raw_mode:
-            return '🔹 Agent'
+        """把 'agent,full' 格式化为显示文本 '🔹 Agent + 🔶 完整'。空字符串表示未部署过。"""
+        if not raw_mode or not raw_mode.strip():
+            return '—'
         modes = [m.strip() for m in raw_mode.split(',') if m.strip()]
         labels = [self._MODE_LABEL.get(m, m) for m in modes]
         return ' + '.join(labels)
@@ -2481,11 +2480,13 @@ class ProxyManagerGUI:
             self.agent_tree.delete(item)
         self.agent_selected_ids.clear()
         for s in servers:
-            platform = self._PLATFORM_LABEL.get(s.get('cloud_provider') or 'auto', '未探测')
+            is_local = bool(s.get('is_local'))
+            platform = '🖥 本机' if is_local else self._PLATFORM_LABEL.get(s.get('cloud_provider') or 'auto', '未探测')
             deploy   = self._DEPLOY_LABEL.get(s.get('last_deploy_status') or 'never', '未部署')
             dmode    = self._format_deploy_mode(s.get('deploy_mode') or 'agent')
+            port_disp = '-' if is_local else s['server_port']
             self.agent_tree.insert('', tk.END, iid=str(s['id']), values=(
-                '', s['id'], s['name'], s['server_host'], s['server_port'],
+                '', s['id'], s['name'], s['server_host'], port_disp,
                 platform, deploy, dmode,
                 '—', '—', '—', '—', '',
             ))
@@ -2800,29 +2801,27 @@ class ProxyManagerGUI:
         from managers.agent_deploy_manager import get_deploy_source
         path, kind = get_deploy_source()
         kind_label = {
-            'imported': '已导入 zip 版',
-            'synced':   '已同步本地版',
-            'bundled':  'EXE 内置版',
-            'external': '外部目录',
-            'missing':  '⚠️ 无可用部署源',
+            'synced':  '可用',
+            'bundled': 'EXE 内置版',
+            'missing': '⚠️ 无可用部署源',
         }.get(kind, kind)
-        display = f"当前部署源: {kind_label}"
+        display = f"部署源: {kind_label}"
         if path:
             display += f"  ({path})"
         self.agent_source_status_var.set(display)
 
     def _agent_sync_source(self):
-        """从外部目录（AGENT_SOURCE_DIR）同步到 _app_root()/resources/<RESOURCE_DIR_NAME>/"""
-        src = AGENT_SOURCE_DIR
-        if not src or not os.path.isdir(src):
-            messagebox.showerror(
-                "同步失败",
-                f"外部源目录不存在：\n{src or '(空)'}\n\n"
-                f"请先在 config.py 设置 AGENT_SOURCE_DIR 指向 gamyy-core 项目根目录。"
-            )
+        """让用户选择 gamyy-core 源码目录，同步到 _app_root()/resources/<RESOURCE_DIR_NAME>/。
+        默认初始目录取 AGENT_SOURCE_DIR（config.py 配置），用户可随时换。"""
+        src = filedialog.askdirectory(
+            title='选择 gamyy-core 源码目录',
+            initialdir=AGENT_SOURCE_DIR if (AGENT_SOURCE_DIR and os.path.isdir(AGENT_SOURCE_DIR)) else os.path.expanduser('~'),
+        )
+        if not src:
             return
+        src = os.path.normpath(src)
         if not os.path.isfile(os.path.join(src, 'agent', 'server.js')):
-            messagebox.showerror("同步失败", f"目录 {src} 不像 gamyy-core 源码（缺 agent/server.js）")
+            messagebox.showerror("同步失败", f"该目录不像 gamyy-core 源码（缺 agent/server.js）:\n{src}")
             return
 
         dst = os.path.join(_app_root(), 'resources', RESOURCE_DIR_NAME)
@@ -2862,8 +2861,64 @@ class ProxyManagerGUI:
 
         self.run_async(do_sync)
 
+    def _agent_github_pull(self):
+        """从 GitHub 拉取 gamyy-core 最新代码，写入统一的部署源目标。
+        目标已有 .git → git pull 增量更新；否则 → 清空后 git clone。"""
+        dst = os.path.join(_app_root(), 'resources', RESOURCE_DIR_NAME)
+        repo_url = 'https://github.com/lixintuo93-boop/gamyy-core'
+
+        def do_pull():
+            import subprocess
+            try:
+                # 检测 git 是否可用
+                try:
+                    subprocess.run(['git', '--version'], capture_output=True, timeout=5, check=True)
+                except Exception:
+                    raise RuntimeError(
+                        "未检测到 Git，请先安装：\n"
+                        "  https://git-scm.com/download/win  (Windows)\n"
+                        "  apt-get install git / brew install git  (Linux/macOS)"
+                    )
+
+                is_git = os.path.isdir(os.path.join(dst, '.git'))
+                if is_git:
+                    # 增量更新
+                    self._agent_log("git pull 更新中...", 'INFO')
+                    result = subprocess.run(
+                        ['git', 'pull', '--ff-only'],
+                        cwd=dst, capture_output=True, text=True, timeout=60,
+                    )
+                    if result.returncode != 0:
+                        raise RuntimeError(f"git pull 失败:\n{result.stderr[:500]}")
+                    self._agent_log(f"git pull 完成\n{result.stdout.strip()[:300]}", 'SUCCESS')
+                else:
+                    # 清空旧内容（可能是 zip 导入 / 外部同步留下的），重新 clone
+                    if os.path.isdir(dst):
+                        self._agent_log(f"清空旧源: {dst}", 'INFO')
+                        shutil.rmtree(dst)
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    self._agent_log(f"git clone {repo_url} ...", 'INFO')
+                    result = subprocess.run(
+                        ['git', 'clone', '--depth', '1', repo_url, dst],
+                        capture_output=True, text=True, timeout=120,
+                    )
+                    if result.returncode != 0:
+                        raise RuntimeError(f"git clone 失败:\n{result.stderr[:500]}")
+                    self._agent_log("git clone 完成", 'SUCCESS')
+
+                # 校验
+                if not os.path.isfile(os.path.join(dst, 'agent', 'server.js')):
+                    raise RuntimeError("拉取完成但目录不像 gamyy-core（缺 agent/server.js）")
+                self.root.after(0, self._agent_refresh_source_status)
+
+            except Exception as e:
+                self._agent_log(f"GitHub 拉取失败: {e}", 'ERROR')
+                self.root.after(0, lambda: messagebox.showerror("拉取失败", str(e)))
+
+        self.run_async(do_pull)
+
     def _agent_import_zip(self):
-        """让用户选 zip，解压到 _app_root()/imported_source/（运行时覆盖最高优先级）"""
+        """让用户选 zip，解压到 _app_root()/resources/<RESOURCE_DIR_NAME>/（统一部署源目标）"""
         zip_path = filedialog.askopenfilename(
             title='选择 gamyy-core 源码压缩包',
             filetypes=[('Zip files', '*.zip'), ('All files', '*.*')],
@@ -2871,7 +2926,7 @@ class ProxyManagerGUI:
         if not zip_path:
             return
 
-        dst = os.path.join(_app_root(), 'imported_source')
+        dst = os.path.join(_app_root(), 'resources', RESOURCE_DIR_NAME)
 
         def do_import():
             try:
@@ -2917,21 +2972,6 @@ class ProxyManagerGUI:
                 self.root.after(0, lambda: messagebox.showerror("导入失败", str(e)))
 
         self.run_async(do_import)
-
-    def _agent_reset_imported(self):
-        """删除 _app_root()/imported_source/，回退到下一优先级（synced/bundled/external）"""
-        dst = os.path.join(_app_root(), 'imported_source')
-        if not os.path.isdir(dst):
-            messagebox.showinfo("提示", "当前没有导入版可以重置")
-            return
-        if not messagebox.askyesno("确认", f"将删除导入版目录：\n{dst}\n\n之后会回退到同步版/内置版/外部目录。继续？"):
-            return
-        try:
-            shutil.rmtree(dst)
-            self._agent_log(f"已重置导入版：{dst}", 'SUCCESS')
-            self._agent_refresh_source_status()
-        except Exception as e:
-            messagebox.showerror("错误", f"删除失败: {e}")
 
     def _agent_batch_start(self):
         ids = self._get_agent_targets()
@@ -3069,137 +3109,6 @@ class ProxyManagerGUI:
             ok = sum(1 for r in results if r['ok'])
             self._agent_set_progress(f"下载完成 ✅{ok} ❌{len(results)-ok}")
             self._agent_log(f"日志DB下载完成：{ok}/{len(results)} 成功，保存至 {target_dir}", 'SUCCESS')
-        self.run_async(run)
-
-    # ──────────────────────────────────────────────────────────
-    # 本地部署（无需 SSH，直接将 gamyy-core 部署到本机）
-    # ──────────────────────────────────────────────────────────
-    # 禁止删除的系统路径（rmtree 保护）
-    _PROTECTED_PATHS = {
-        os.path.normpath(p) for p in [
-            os.environ.get('SystemDrive', 'C:') + os.sep,
-            'C:\\', 'D:\\', 'E:\\', 'F:\\', 'G:\\',
-            'C:\\Windows', 'C:\\Program Files', 'C:\\Program Files (x86)',
-            os.path.expanduser('~'), os.path.join(os.environ['SystemDrive'] + os.sep, 'Users'),
-        ]
-    }
-
-    def _local_deploy(self):
-        """弹出目录选择，在所选目录内创建 gamyy-core 子目录并部署"""
-        from tkinter import filedialog, messagebox
-        from config import _app_root, _resource_root, RESOURCE_DIR_NAME
-
-        default_parent = os.path.join(os.environ.get('SystemDrive', 'C:') + os.sep, 'opt')
-        parent = filedialog.askdirectory(
-            title='选择部署父目录（会在其下创建 gamyy-core 子目录）',
-            initialdir=default_parent if os.path.exists(default_parent) else os.path.expanduser('~'),
-        )
-        if not parent:
-            return
-        parent = os.path.normpath(parent)
-        target = os.path.join(parent, 'gamyy-core')
-
-        # 安全检查：禁止选择系统关键目录
-        if os.path.normpath(parent + os.sep) in self._PROTECTED_PATHS:
-            messagebox.showerror("错误", f"不允许部署到系统关键路径：{parent}\n请选择一个普通目录（如 C:\\opt）")
-            return
-
-        self._agent_log(f"本地部署 → {target}", 'INFO')
-        self._agent_set_progress("本地部署：准备中...")
-
-        def run():
-            try:
-                # 1. 定位部署源
-                source = None
-                for d in [
-                    os.path.join(_app_root(), 'imported_source'),
-                    os.path.join(_app_root(), 'resources', RESOURCE_DIR_NAME),
-                    os.path.join(_resource_root(), 'resources', RESOURCE_DIR_NAME),
-                ]:
-                    if os.path.isdir(d) and os.path.isfile(os.path.join(d, 'web', 'server.js')):
-                        source = d
-                        break
-                if not source:
-                    self._agent_log("找不到 gamyy-core 部署源（请先同步或导入）", 'ERROR')
-                    self._agent_set_progress("本地部署失败：无部署源")
-                    return
-
-                # 2. 清理旧部署（只删 gamyy-core 子目录下的文件，不动父目录）
-                self._agent_log(f"复制文件: {source} → {target}", 'INFO')
-                self._agent_set_progress("本地部署：复制文件中...")
-                import shutil
-                # 备份旧数据库（如果存在）
-                if os.path.exists(target):
-                    for db in ['config.db', 'hospital.db', 'ticket_checker.db']:
-                        src_db = os.path.join(target, 'data', db)
-                        if os.path.exists(src_db):
-                            bak = src_db + '.local_bak'
-                            try:
-                                shutil.copy2(src_db, bak)
-                                self._agent_log(f"已备份 {db}", 'INFO')
-                            except Exception:
-                                pass
-                    # 只删 gamyy-core 子目录本身，不动父目录
-                    shutil.rmtree(target, ignore_errors=True)
-                # 复制源码
-                shutil.copytree(source, target,
-                    ignore=shutil.ignore_patterns('node_modules', '.git', '__pycache__', '*.pyc'))
-
-                # 3. 检查 Node.js
-                self._agent_set_progress("本地部署：检查 Node.js...")
-                import subprocess
-                node_ok = False
-                try:
-                    v = subprocess.check_output(['node', '-v'], timeout=5).decode().strip()
-                    major = int(v.lstrip('v').split('.')[0])
-                    if major >= 18:
-                        self._agent_log(f"Node.js {v} OK", 'INFO')
-                        node_ok = True
-                except Exception:
-                    pass
-                if not node_ok:
-                    self._agent_log("未找到 Node.js >= 18，请先安装 Node.js 22 LTS", 'ERROR')
-                    self._agent_log("下载: https://nodejs.org/en/download", 'ERROR')
-                    self._agent_set_progress("本地部署失败：需要 Node.js >= 18")
-                    return
-
-                # 4. npm install
-                self._agent_set_progress("本地部署：npm install...")
-                self._agent_log("npm install（可能需要几分钟）...", 'INFO')
-                result = subprocess.run(
-                    ['npm', 'install', '--omit=dev', '--legacy-peer-deps'],
-                    cwd=target, capture_output=True, text=True, timeout=300,
-                )
-                if result.returncode != 0:
-                    self._agent_log(f"npm install 失败: {result.stderr[:300]}", 'ERROR')
-                    self._agent_set_progress("本地部署失败：npm install 出错")
-                    return
-                self._agent_log("npm install 完成", 'SUCCESS')
-
-                # 5. 后台启动
-                self._agent_set_progress("本地部署：启动服务...")
-                log_file = os.path.join(target, 'server.log')
-                proc = subprocess.Popen(
-                    ['node', 'web', 'server.js'],
-                    cwd=target,
-                    stdout=open(log_file, 'w'),
-                    stderr=subprocess.STDOUT,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
-                )
-                self._agent_log(f"已启动 node web/server.js (PID={proc.pid})", 'SUCCESS')
-                self._agent_log(f"日志: {log_file}", 'INFO')
-
-                # 6. 打开浏览器
-                time.sleep(2)
-                import webbrowser
-                webbrowser.open('http://localhost:3000')
-                self._agent_log("已打开 http://localhost:3000", 'SUCCESS')
-                self._agent_set_progress("本地部署完成 ✅")
-
-            except Exception as e:
-                self._agent_log(f"本地部署异常: {e}", 'ERROR')
-                self._agent_set_progress("本地部署失败")
-
         self.run_async(run)
 
     # 关闭流程的兜底超时（秒）：到点直接 destroy，未完成的 paramiko close 由进程退出回收

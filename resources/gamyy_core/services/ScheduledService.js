@@ -39,7 +39,7 @@ class ScheduledService {
     this.proxyEarlyStopped = new Map();       // proxyKey -> boolean 每个代理的早停状态
     this.proxyEarlyStopThreshold = new Map(); // proxyKey -> number  每个代理的早停阈值（ms）
     this.proxyAutoCloseConfig = new Map();    // proxyKey -> { enabled, maxSuccessChannels }
-    this.proxyMaxSuccessChannels = new Map(); // proxyKey -> number  每个代理的最大成功通道数（Infinity=不限）
+    this.proxyMaxAliveChannels = new Map();   // proxyKey -> number  每个代理的最大存活通道数上限（0=不限）
     
     // 时间戳
     this.phase1StartTimestamp = null;
@@ -232,6 +232,12 @@ class ScheduledService {
     return false;
   }
   
+  // 统计某代理当前存活（已连接且未停止）的通道数量
+  _countAliveChannels(proxyKey) {
+    const channels = this.ticketService?.connectionPool?.getChannelsByProxy(proxyKey) || [];
+    return channels.filter(ch => ch.isConnected && !ch.isStopped).length;
+  }
+
   // 关闭多余通道（保留过期时间最晚的，per-proxy）
   closeExcessChannels(proxyKey) {
     const cfg = this.proxyAutoCloseConfig.get(proxyKey);
@@ -525,9 +531,9 @@ class ScheduledService {
           const aceMax     = ovACE.maxSuccessChannels;
           this.proxyAutoCloseConfig.set(proxyKey, { enabled: aceEnabled, maxSuccessChannels: aceMax });
 
-          // 最大成功通道数（per-proxy，0 或未设置表示不限）
-          const rawMaxSucc = ov.maxSuccessChannels ?? 0;
-          this.proxyMaxSuccessChannels.set(proxyKey, rawMaxSucc > 0 ? rawMaxSucc : Infinity);
+          // 最大存活通道数（per-proxy，0 或未设置表示不限）
+          const rawMaxAlive = ov.maxSuccessChannels ?? 0;
+          this.proxyMaxAliveChannels.set(proxyKey, rawMaxAlive > 0 ? rawMaxAlive : 0);
         }
         proxyTotalChannels.set(proxyKey, (proxyTotalChannels.get(proxyKey) || 0) + 1);
       });
@@ -540,6 +546,10 @@ class ScheduledService {
         if (this.proxyEarlyStopped.get(proxyKey)) return;
         if (this.checkEarlyStop(proxyKey)) return;
 
+        // 存活通道数已达上限 → 跳过本次创建，后续时间槽会继续尝试
+        const maxAlive = this.proxyMaxAliveChannels.get(proxyKey) || 0;
+        if (maxAlive > 0 && this._countAliveChannels(proxyKey) >= maxAlive) return;
+
         channel.attemptPhase = 1;
         stats.phase1.total++;
 
@@ -550,19 +560,6 @@ class ScheduledService {
             this.closeExcessChannels(proxyKey);
             if (this.channelStarter && Date.now() >= this.checkStartTimestamp) {
               this.channelStarter.scheduleNewChannelCheck(proxyKey, channel);
-            }
-            // 成功数达到上限，取消剩余定时器
-            const maxSucc = this.proxyMaxSuccessChannels.get(proxyKey) ?? Infinity;
-            if (isFinite(maxSucc) && stats.phase1.success >= maxSucc) {
-              this.proxyEarlyStopped.set(proxyKey, true);
-              const timers = this.proxyPhase1Timers.get(proxyKey);
-              let cancelledCount = 0;
-              if (timers) {
-                timers.forEach(timer => { if (timer && !timer._called) { clearTimeout(timer); cancelledCount++; } });
-              }
-              this.ticketService.printEventLog(
-                `🛑 [${proxyKey}] 已成功创建${maxSucc}个通道，停止创建，取消${cancelledCount}个剩余定时器`
-              );
             }
           }
           this.checkEarlyStop(proxyKey);
@@ -831,7 +828,7 @@ class ScheduledService {
         const lines = [];
         lines.push(`  ▸ ${proxyTag} (id=${p.id})`);
         lines.push(`    通道: ${ph1.startTime || '—'} 开始，窗口${(ph1.windowTime || 0)/1000}s，尝试${ph1.attempts ?? '—'}次，分布:${ph1.distribution || 'uniform'}`);
-        if (ph1.maxSuccessChannels) lines.push(`         最大成功通道:${ph1.maxSuccessChannels}`);
+                if (ph1.maxSuccessChannels) lines.push(`         最大存活通道:${ph1.maxSuccessChannels}`);
         if (ph1.earlyStop?.enabled) {
           const es = ph1.earlyStop;
           const desc = es.algorithm === 'fixed' ? `固定${es.fixedThreshold || 10000}ms` : `动态×${es.multiplier || 10}`;

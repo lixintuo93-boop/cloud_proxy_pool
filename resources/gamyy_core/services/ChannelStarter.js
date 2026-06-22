@@ -362,6 +362,12 @@ class ChannelStarter {
         if (stopCount > 0 && foundCount >= stopCount) {
           this.stopProxyCheckScheduler(proxyKey);
         }
+      } else if (result.targetExhausted) {
+        // 🆕 目标医生+日期的所有号源余票均为0，停止查号调度器
+        this.ticketService.printEventLog(
+          `🛑 [${this.formatTime()}] 代理 ${proxyKey} 目标已售罄，停止查号调度器`
+        );
+        this.stopProxyCheckScheduler(proxyKey);
       } else {
         // 请求成功但没有票，尝试复用通道
         this.tryReuseChannel(proxyKey, channel, immediateRunning);

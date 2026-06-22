@@ -35,16 +35,14 @@ router.post('/', (req, res) => {
        doctor_source, doctor_select_mode, doctor_codes, doctor_plan_date_start,
        dept_code, dept_plan_date_start, dept_plan_date_end,
        keepalive_enabled, keepalive_interval_min, keepalive_interval_max,
-       keepalive_request_type, keepalive_business_endpoints, direct_keepalive_enabled, heartbeat_timeout,
-       fingerprint_config)
+       keepalive_request_type, keepalive_business_endpoints, direct_keepalive_enabled, heartbeat_timeout)
       VALUES (@name, @description, @check_mode, @check_start_time, @check_window_time, @check_min_interval,
        @check_distribution, @check_stop_after_found_count, @check_reuse_channel,
        @lock_config, @channel_build_overrides, @target_hosts,
        @doctor_source, @doctor_select_mode, @doctor_codes, @doctor_plan_date_start,
        @dept_code, @dept_plan_date_start, @dept_plan_date_end,
        @keepalive_enabled, @keepalive_interval_min, @keepalive_interval_max,
-       @keepalive_request_type, @keepalive_business_endpoints, @direct_keepalive_enabled, @heartbeat_timeout,
-       @fingerprint_config)`).run({
+       @keepalive_request_type, @keepalive_business_endpoints, @direct_keepalive_enabled, @heartbeat_timeout)`).run({
       name:                       b.name,
       description:                b.description ?? null,
       check_mode:                 b.check_mode ?? 'doctor',
@@ -72,7 +70,6 @@ router.post('/', (req, res) => {
       keepalive_business_endpoints: JSON.stringify(Array.isArray(b.keepalive_business_endpoints) ? b.keepalive_business_endpoints : []),
       direct_keepalive_enabled:     b.direct_keepalive_enabled != null ? (b.direct_keepalive_enabled ? 1 : 0) : 0,
       heartbeat_timeout:            b.heartbeat_timeout != null ? parseInt(b.heartbeat_timeout, 10) : 300000,
-      fingerprint_config:           JSON.stringify(b.fingerprint_config ?? { name: 'android_app' }),
     });
     ok(res, parse(getDb().prepare('SELECT * FROM proxy_templates WHERE id = ?').get(r.lastInsertRowid)), 201);
   } catch (e) {
@@ -132,7 +129,6 @@ router.put('/:id', (req, res) => {
       keepalive_business_endpoints = COALESCE(@keepalive_business_endpoints, keepalive_business_endpoints),
       direct_keepalive_enabled = COALESCE(@direct_keepalive_enabled, direct_keepalive_enabled),
       heartbeat_timeout = COALESCE(@heartbeat_timeout, heartbeat_timeout),
-      fingerprint_config = COALESCE(@fingerprint_config, fingerprint_config),
       updated_at = @updated_at WHERE id = @id`).run({
       id:                         req.params.id,
       name:                       b.name ?? null,
@@ -161,7 +157,6 @@ router.put('/:id', (req, res) => {
       keepalive_business_endpoints: b.keepalive_business_endpoints != null ? JSON.stringify(Array.isArray(b.keepalive_business_endpoints) ? b.keepalive_business_endpoints : []) : null,
       direct_keepalive_enabled:     b.direct_keepalive_enabled != null ? (b.direct_keepalive_enabled ? 1 : 0) : null,
       heartbeat_timeout:            b.heartbeat_timeout != null ? parseInt(b.heartbeat_timeout, 10) : null,
-      fingerprint_config:           b.fingerprint_config != null ? JSON.stringify(b.fingerprint_config) : null,
       updated_at:                 now(),
     });
     ok(res, parse(db.prepare('SELECT * FROM proxy_templates WHERE id = ?').get(req.params.id)));
@@ -192,7 +187,6 @@ function parse(row) {
     target_hosts:            row.target_hosts ? JSON.parse(row.target_hosts) : null,
     doctor_codes:            JSON.parse(row.doctor_codes || '[]'),
     keepalive_business_endpoints: JSON.parse(row.keepalive_business_endpoints || '[]'),
-    fingerprint_config:      row.fingerprint_config ? JSON.parse(row.fingerprint_config) : null,
   };
 }
 

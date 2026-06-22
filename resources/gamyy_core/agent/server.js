@@ -177,12 +177,6 @@ process.on('SIGTERM', shutdown);
 // ─── 启动 ─────────────────────────────────────────────────────────────────────
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Gamyy Cloud Agent 已启动，监听端口 ${PORT}`);
-  // TLS 指纹自检：一眼看出请求走 sidecar(带指纹) 还是原生 TLS
-  if (process.env.FP_SIDECAR_ADDR) {
-    console.log(`   🔒 TLS 指纹: sidecar 模式 (FP_SIDECAR_ADDR=${process.env.FP_SIDECAR_ADDR})`);
-  } else {
-    console.log(`   ⚠️  TLS 指纹: 原生模式 (未设 FP_SIDECAR_ADDR，连接走 Node 原生指纹)`);
-  }
   console.log(`   健康检查: GET  http://0.0.0.0:${PORT}/health`);
   console.log(`   启动任务: POST http://0.0.0.0:${PORT}/run`);
   console.log(`   任务状态: GET  http://0.0.0.0:${PORT}/status/:taskId`);

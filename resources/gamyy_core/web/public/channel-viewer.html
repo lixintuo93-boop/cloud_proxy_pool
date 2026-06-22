@@ -1057,6 +1057,7 @@
             batches: [],
             selectedBatches: [],
             selectedProxy: null,
+            lastChannelProxy: null,     // 切回通道视图时恢复的代理
             selectedProxies: new Set(),
             proxyInfo: {},
             processedData: null,
@@ -2229,7 +2230,23 @@
         // 请求追踪分析 — 数据构建
         // ═══════════════════════════════════════════════════════════════
 
-        function setViewMode(mode) { state.viewMode = mode; render(); }
+        function setViewMode(mode) {
+            if (mode === 'trace' && state.viewMode === 'channel') {
+                // 通道 → 请求分析：限定范围 = 当前正在看的这一个代理
+                state.selectedProxies = new Set(state.selectedProxy ? [state.selectedProxy] : []);
+                state.traceData = null;
+            }
+            if (mode === 'channel' && state.viewMode === 'trace') {
+                // 请求分析 → 通道视图：恢复上次查看的代理（若仍在勾选集合中）
+                if (state.lastChannelProxy && state.selectedProxies.has(state.lastChannelProxy)) {
+                    state.selectedProxy = state.lastChannelProxy;
+                } else {
+                    state.selectedProxy = [...state.selectedProxies][0] || null;
+                }
+            }
+            state.viewMode = mode;
+            render();
+        }
 
         function queryObj(db, sql, params) {
             try {
@@ -3674,7 +3691,7 @@
                 <div class="header">
                     <h1>🔬 通道生命周期可视化分析器</h1>
                     <div class="header-actions">
-                        ${state.processedData ? `
+                        ${state.selectedBatches.length > 0 ? `
                         <div class="view-mode-switcher">
                             <button class="view-mode-btn ${state.viewMode==='channel'?'active':''}" onclick="setViewMode('channel')">🔬 通道视图</button>
                             <button class="view-mode-btn ${state.viewMode==='trace'?'active':''}" onclick="setViewMode('trace')">🔍 请求分析</button>
@@ -5156,6 +5173,7 @@
                 state.batches = [];
                 state.selectedBatches = [];
                 state.selectedProxy = null;
+                state.lastChannelProxy = null;
                 state.selectedProxies = new Set();
                 state.processedData = null;
                 state._uidCounter = 0;
@@ -5275,6 +5293,7 @@
                 el.addEventListener('click', () => {
                     if (state.viewMode === 'channel') {
                         state.selectedProxy = el.dataset.proxy;
+                        state.lastChannelProxy = el.dataset.proxy;
                         state.selectedTargetHost = null;
                         render();
                     } else {

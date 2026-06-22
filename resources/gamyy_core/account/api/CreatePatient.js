@@ -1,13 +1,13 @@
 'use strict';
 
 const BaseAPI  = require('../BaseAPI');
-const HEADERS  = require('../HeadersConfig');
+const { DEFAULT_HEADERS } = require('../HeadersConfig');
 const C        = require('../constants');
 
 /**
  * POST /data-transfor/createPatient — 建档（plain JSON, NOT AES-encrypted）
  *
- * Params: { cardNo, patientName, sex: '男'|'女', birthday: 'YYYYMMDD', mobile }
+ * Params: { cardNo, patientName, sex: '男'|'女', birthday: 'YYYY-MM-DD', mobile }
  */
 class CreatePatient extends BaseAPI {
   constructor(session, config = {}) {
@@ -17,14 +17,19 @@ class CreatePatient extends BaseAPI {
 
   buildHeaders() {
     const platform = this.session.getPlatform();
+    const H = this.session.headers || DEFAULT_HEADERS;
     let template;
-    if (platform === 'wechat')       template = HEADERS.MOBILE_WEB_WX;
-    else if (platform === 'android') template = HEADERS.MOBILE_WEB_ANDROID;
-    else                             template = HEADERS.MOBILE_WEB;
+    if (platform === 'wechat')       template = H.MOBILE_WEB_WX;
+    else if (platform === 'android') template = H.MOBILE_WEB_ANDROID;
+    else                             template = H.MOBILE_WEB;
 
     const headers = { ...template, 's456hr8': this.session.getS456hr8() };
     const token = this.session.getAuthToken();
-    if (token) headers['token'] = token;
+    if (token) {
+      headers['token'] = token;
+    } else if (platform === 'android') {
+      delete headers['token'];
+    }
     headers['SubmitSign'] = this.session.getSubmitSign() || '';
     if (platform !== 'wechat') {
       const full = this.session.getCookie('mobile_manage');
@@ -64,7 +69,7 @@ class CreatePatient extends BaseAPI {
       cardNo,
       patientName,
       sex,          // '男' | '女'
-      birthday,     // YYYYMMDD
+      birthday,     // YYYY-MM-DD
       mobile,
       chargeType: '自费',
       hospitalId: C.HOSPITAL_ID,

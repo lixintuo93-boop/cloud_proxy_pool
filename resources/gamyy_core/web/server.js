@@ -18,7 +18,6 @@ const accountsRouter = require('./routes/accounts');
 const accountOperationsRouter = require('./routes/accountOperations');
 const proxyTemplatesRouter = require('./routes/proxyTemplates');
 const proxiesRouter        = require('./routes/proxies');
-const fingerprintsRouter   = require('./routes/fingerprints');
 const proxyPoolRouter      = require('./routes/proxyPool');
 const taskControlRouter = require('./routes/taskControl');
 const logsRouter = require('./routes/logs');
@@ -50,7 +49,6 @@ function createApp() {
   app.use('/api/tasks',           tasksRouter);
   app.use('/api/proxy-templates', proxyTemplatesRouter);
   app.use('/api/proxies',         proxiesRouter);
-  app.use('/api/fingerprints',    fingerprintsRouter);
   app.use('/api/proxy-pool',      proxyPoolRouter);
   app.use('/api/tasks',           taskControlRouter); // /api/tasks/:id/start|stop|status
   app.use('/api/logs',            logsRouter);

@@ -9,7 +9,13 @@ __pycache__/
 # === 构建产物 ===
 build/
 dist/
-*.spec
+
+# === 运行时生成的目录 ===
+imported_source/
+local_deploy/
+
+# === 临时测试文件 ===
+_smoke*.py
 
 # === 运行时数据 ===
 proxy_manager.db

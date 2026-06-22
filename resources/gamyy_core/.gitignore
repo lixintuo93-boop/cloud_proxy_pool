@@ -1,0 +1,35 @@
+# === 依赖 ===
+node_modules/
+frontend/node_modules/
+
+# === 日志 ===
+*.log
+*.txt
+!requirements.txt
+
+# === 抓包与临时文件 ===
+*.pcapng
+*.pcap
+
+# === 数据库备份 ===
+data/*.bak
+data/*.backup
+
+# === 操作系统 ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === IDE ===
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# === 构建产物 ===
+dist/
+frontend/dist/
+
+# === PM2 ===
+.pm2/
+pm2*.log

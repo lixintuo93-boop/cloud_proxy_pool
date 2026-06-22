@@ -38,7 +38,6 @@ function parse(row) {
     lock_config:              row.lock_config ? JSON.parse(row.lock_config) : null,
     doctor_codes:             row.doctor_codes ? JSON.parse(row.doctor_codes) : null,
     keepalive_business_endpoints: row.keepalive_business_endpoints ? JSON.parse(row.keepalive_business_endpoints) : null,
-    fingerprint_config:       row.fingerprint_config ? JSON.parse(row.fingerprint_config) : null,
   };
 }
 
@@ -82,7 +81,6 @@ function parseWithEffective(db, row) {
       keepalive_business_endpoints: eff.keepAlive?.request?.enabledEndpoints,
       direct_keepalive_enabled:     eff.keepAlive?.directKeepaliveEnabled,
       heartbeat_timeout:            eff.timeout?.heartbeatTimeout,
-      fingerprint:                  eff.fingerprint,
     },
   };
 }
@@ -154,7 +152,6 @@ router.patch('/:id/template', (req, res) => {
       keepalive_business_endpoints = @keepalive_business_endpoints,
       direct_keepalive_enabled = @direct_keepalive_enabled,
       heartbeat_timeout = @heartbeat_timeout,
-      fingerprint_config = @fingerprint_config,
       updated_at = @updated_at WHERE id = @id`).run({
       id:                           req.params.id,
       tid:                          tmpl.id,
@@ -182,7 +179,6 @@ router.patch('/:id/template', (req, res) => {
       keepalive_business_endpoints: tmpl.keepalive_business_endpoints,
       direct_keepalive_enabled:     tmpl.direct_keepalive_enabled,
       heartbeat_timeout:            tmpl.heartbeat_timeout,
-      fingerprint_config:           tmpl.fingerprint_config,
       updated_at:                   now(),
     });
     ok(res, parse(db.prepare('SELECT * FROM proxies WHERE id = ?').get(req.params.id)));
@@ -223,7 +219,6 @@ router.post('/batch/apply-template', (req, res) => {
       keepalive_business_endpoints = @keepalive_business_endpoints,
       direct_keepalive_enabled = @direct_keepalive_enabled,
       heartbeat_timeout = @heartbeat_timeout,
-      fingerprint_config = @fingerprint_config,
       updated_at = @updated_at
       WHERE account_id = @account_id`).run({
       account_id:                   accountId,
@@ -252,7 +247,6 @@ router.post('/batch/apply-template', (req, res) => {
       keepalive_business_endpoints: tmpl.keepalive_business_endpoints,
       direct_keepalive_enabled:     tmpl.direct_keepalive_enabled,
       heartbeat_timeout:            tmpl.heartbeat_timeout,
-      fingerprint_config:           tmpl.fingerprint_config,
       updated_at:                   now(),
     });
     const updated = db.prepare('SELECT COUNT(*) AS n FROM proxies WHERE account_id = ?').get(accountId).n;
@@ -326,7 +320,6 @@ router.put('/:id/config', (req, res) => {
     setIfPresent('keepalive_business_endpoints', v => Array.isArray(v) ? JSON.stringify(v) : null);
     setIfPresent('direct_keepalive_enabled',     v => v != null ? (v ? 1 : 0) : null);
     setIfPresent('heartbeat_timeout',            v => v != null ? parseInt(v, 10) : null);
-    setIfPresent('fingerprint_config',           v => v != null ? JSON.stringify(v) : null);
 
     if (setClauses.length > 0) {
       setClauses.push('updated_at = @updated_at');

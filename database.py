@@ -149,11 +149,28 @@ class ProxyDatabase:
         except sqlite3.OperationalError:
             cursor.execute("ALTER TABLE ssh_servers ADD COLUMN last_deploy_status TEXT NOT NULL DEFAULT 'never'")
 
-        # 幂等迁移：ssh_servers 加 deploy_mode 字段（'agent' / 'full'）
+        # 幂等迁移：ssh_servers 加 deploy_mode 字段（'agent' / 'full' / ''=未部署）
         try:
             cursor.execute("SELECT deploy_mode FROM ssh_servers LIMIT 1")
         except sqlite3.OperationalError:
-            cursor.execute("ALTER TABLE ssh_servers ADD COLUMN deploy_mode TEXT NOT NULL DEFAULT 'agent'")
+            cursor.execute("ALTER TABLE ssh_servers ADD COLUMN deploy_mode TEXT NOT NULL DEFAULT ''")
+        # 清理旧默认值污染：从未部署过的服务器 deploy_mode 置空
+        cursor.execute("UPDATE ssh_servers SET deploy_mode = '' WHERE last_deploy_status = 'never' AND deploy_mode = 'agent'")
+
+        # 幂等迁移：ssh_servers 加 is_local 字段（1=本机伪服务器，0=普通 SSH 服务器）
+        try:
+            cursor.execute("SELECT is_local FROM ssh_servers LIMIT 1")
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE ssh_servers ADD COLUMN is_local INTEGER NOT NULL DEFAULT 0")
+
+        # 播种「本机」伪服务器行（server_host UNIQUE 保证只有一条；deploy_mode 初始为空 = 未部署）。
+        # 本地部署 = 完整部署跑在本机，username/password 仅占位，永不用于 SSH。
+        cursor.execute(
+            "INSERT OR IGNORE INTO ssh_servers "
+            "(name, server_host, server_port, username, password, cloud_provider, last_deploy_status, deploy_mode, is_local) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ('本机', '127.0.0.1', 0, 'local', 'local', 'default', 'never', '', 1)
+        )
 
         conn.commit()
         conn.close()
@@ -536,8 +553,14 @@ class ProxyDatabase:
         cursor = conn.cursor()
 
         try:
+            # 守卫：本机伪服务器（is_local=1）不允许删除
+            cursor.execute('SELECT is_local FROM ssh_servers WHERE id = ?', (server_id,))
+            row = cursor.fetchone()
+            if row and row[0]:
+                conn.close()
+                return False, "本机条目不可删除"
             cursor.execute('DELETE FROM proxies WHERE ssh_server_id = ?', (server_id,))
-            cursor.execute('DELETE FROM ssh_servers WHERE id = ?', (server_id,))
+            cursor.execute('DELETE FROM ssh_servers WHERE id = ? AND is_local = 0', (server_id,))
 
             conn.commit()
             conn.close()
@@ -548,13 +571,17 @@ class ProxyDatabase:
             return False, f"删除失败: {str(e)}"
 
     def delete_all_servers_and_proxies(self):
-        """删除所有服务器和代理"""
+        """删除所有服务器和代理（保留本机伪服务器行）"""
         conn = sqlite3.connect(self.db_file)
         cursor = conn.cursor()
 
         try:
-            cursor.execute('DELETE FROM proxies')
-            cursor.execute('DELETE FROM ssh_servers')
+            # 保留本机行：只删非本机服务器的代理与服务器
+            cursor.execute(
+                'DELETE FROM proxies WHERE ssh_server_id IN '
+                '(SELECT id FROM ssh_servers WHERE is_local = 0)'
+            )
+            cursor.execute('DELETE FROM ssh_servers WHERE is_local = 0')
 
             conn.commit()
             conn.close()

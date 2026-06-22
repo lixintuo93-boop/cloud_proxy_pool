@@ -187,10 +187,9 @@ class AccountOperationService {
 
           // 建档（不加密，plain JSON）
           try {
-            const birthdayRaw = birthday.replace(/-/g, '');
             const genderCN    = sex === '1' ? '男' : '女';
             const createApi   = new CreatePatient(sm);
-            await createApi.execute({ cardNo: idNo, patientName: name, sex: genderCN, birthday: birthdayRaw, mobile: account.mobile });
+            await createApi.execute({ cardNo: idNo, patientName: name, sex: genderCN, birthday, mobile: account.mobile });
           } catch (e) {
             sm._log(`建档异常（不影响绑定结果）: ${e.message}`);
           }

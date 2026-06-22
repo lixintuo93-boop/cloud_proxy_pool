@@ -158,6 +158,15 @@ AGENT_FULL_REMOTE_DIR = "/opt/gamyy-core"     # 远端目录（区别于 AGENT_R
 AGENT_FULL_PM2_NAME   = "gamyy-web"           # PM2 进程名（区别于 AGENT_PM2_NAME）
 AGENT_FULL_PORT       = 3000                   # web/server.js 默认端口
 
+# ──────────── 本地部署目录（"本地部署" / 本机伪服务器） ─────────────
+# 本地部署 = 完整部署（full 模式）跑在本机，不走 SSH。
+# 目录【固定】不让用户在 GUI 里选盘符（历史上选 E:\ 导致整盘被删）；
+# 高级用户可在 user_settings.json 写 "local_deploy_dir" 覆盖。
+# 默认派生自 _app_root()：开发态=项目目录/local_deploy/gamyy-core；打包后=EXE 同目录下。
+LOCAL_DEPLOY_DIR = _coerce_str('local_deploy_dir', os.path.join(os.path.dirname(_app_root()), 'gamyy-core'))
+# 本机伪服务器在 ssh_servers 中的固定标识
+LOCAL_SERVER_HOST = '127.0.0.1'
+
 # 部署源解析使用的目录名（resources/ 下的子目录）
 RESOURCE_DIR_NAME = 'gamyy_core'
 

@@ -253,14 +253,6 @@ apt-get install -y iptables-persistent && netfilter-persistent save
 3. 「云端 Agent URL」填入 `http://101.200.241.73:7070`
 4. 点击「检测连接」确认 → 保存
 
-### （可选）TLS 指纹 sidecar
-
-若要让 account 查号/锁号请求带真实 TLS 指纹（见 [`TLS_FINGERPRINT.md`](./TLS_FINGERPRINT.md)）：
-在 `cloud_proxy_pool` 的 `user_settings.json` 设 `fp_sidecar_enabled: true`，部署时会自动上传
-Linux 版 `fp-sidecar` 二进制、PM2 拉起（名 `fp-sidecar`，监听 `127.0.0.1:8788`），并给 node 进程
-注入 `FP_SIDECAR_ADDR`。需先交叉编译：`GOOS=linux GOARCH=amd64 go -C fp-sidecar build -o fp-sidecar .`。
-不开则保持原生 TLS（零变更）。
-
 ---
 
 ## 八、目录结构（部署后服务器上）

@@ -2,7 +2,6 @@
 
 const { Router } = require('express');
 const { getDb, ok, err, now } = require('./_helper');
-const { resolveFingerprint, DEFAULT_FINGERPRINT } = require('../../services/fingerprints');
 
 const router = Router();
 
@@ -367,8 +366,6 @@ function resolveProxyEffectiveConfig(sys, proxy, tmpl) {
       reuseChannel:        reuseCh,
     },
     lockRequest:            { global: lockCfg },
-    // TLS 指纹（代理级）：代理覆盖列 → 模板列 → 默认 android_app，解析成完整指纹对象
-    fingerprint:            resolveFingerprint(pickJson('fingerprint_config', { name: DEFAULT_FINGERPRINT })),
     proxyClassifier,
     cloudUnreachableAction: sys.cloud_unreachable_action || 'fallback',
   };

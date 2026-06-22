@@ -40,14 +40,18 @@ from config import (
     AGENT_DEPLOY_WORKERS, AGENT_OP_WORKERS,
     AGENT_REMOTE_DB, AGENT_LOG_SAVE_DIR,
     AGENT_FULL_REMOTE_DIR, AGENT_FULL_PM2_NAME, AGENT_FULL_PORT,
-    RESOURCE_DIR_NAME,
+    RESOURCE_DIR_NAME, LOCAL_DEPLOY_DIR,
     _app_root, _resource_root,
     get_beijing_time_str,
+)
+from managers.executors import (
+    SSHExecutor, LocalExecutor,
+    AGENT_WINDOWS_REMOTE_DIR, AGENT_WINDOWS_FULL_REMOTE_DIR,
 )
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 部署源解析（imported > synced > bundled > external）
+# 部署源解析（统一目标：resources/gamyy_core/ → 内置版回退）
 # ──────────────────────────────────────────────────────────────────────
 def _is_valid_source(path):
     """判断目录里是否有 agent/server.js，作为"合法 gamyy-core 源"的最简指标。"""
@@ -58,27 +62,18 @@ def _is_valid_source(path):
 
 def get_deploy_source():
     """
-    解析部署源目录，按优先级返回 (path, kind)。
-    kind in: 'imported' / 'synced' / 'bundled' / 'external' / 'missing'
+    解析部署源目录，返回 (path, kind)。
+    kind in: 'synced' / 'bundled' / 'missing'
 
-    1. _app_root()/imported_source/                  ← "📤 导入 zip"写入处（运行时覆盖）
-    2. _app_root()/resources/<RESOURCE_DIR_NAME>/     ← "📥 同步"写入处（dev 时在项目里；EXE 时在 EXE 同目录）
-    3. _resource_root()/resources/<RESOURCE_DIR_NAME>/← PyInstaller --add-data 打进 EXE 的内置版（仅 EXE 模式有意义）
-    4. AGENT_SOURCE_DIR                                ← GUI 外部目录 fallback
+    1. _app_root()/resources/<RESOURCE_DIR_NAME>/     ← 所有导入方式统一写入这里
+    2. _resource_root()/resources/<RESOURCE_DIR_NAME>/ ← PyInstaller --add-data 内置版（仅 EXE 模式有意义）
     """
-    candidates = [
-        (os.path.join(_app_root(), 'imported_source'), 'imported'),
-        (os.path.join(_app_root(), 'resources', RESOURCE_DIR_NAME), 'synced'),
-    ]
+    synced = os.path.join(_app_root(), 'resources', RESOURCE_DIR_NAME)
+    if _is_valid_source(synced):
+        return synced, 'synced'
     bundled = os.path.join(_resource_root(), 'resources', RESOURCE_DIR_NAME)
-    if bundled != candidates[1][0]:
-        candidates.append((bundled, 'bundled'))
-    if AGENT_SOURCE_DIR:
-        candidates.append((AGENT_SOURCE_DIR, 'external'))
-
-    for p, k in candidates:
-        if _is_valid_source(p):
-            return p, k
+    if bundled != synced and _is_valid_source(bundled):
+        return bundled, 'bundled'
     return None, 'missing'
 
 
@@ -101,10 +96,8 @@ _FULL_EXCLUDE_SPECIFIC = {
     os.path.join('data', 'ticket_checker.db'),     # 远端运行时生成
 }
 
-#  Windows 远程部署路径（与 Linux /opt/... 区分）
-#  使用正斜杠兼容 cmd.exe 和 SFTP
-AGENT_WINDOWS_REMOTE_DIR = "C:/opt/gamyy-agent"
-AGENT_WINDOWS_FULL_REMOTE_DIR = "C:/opt/gamyy-core"
+# Windows 远程/本地部署路径常量已移到 managers/executors.py（AGENT_WINDOWS_REMOTE_DIR /
+# AGENT_WINDOWS_FULL_REMOTE_DIR），此处通过 import 引入，避免重复定义。
 
 
 def _should_skip_full(rel_path, is_dir):
@@ -138,7 +131,13 @@ class AgentDeployManager:
         # 防止同一台服务器被两批部署任务并发撞 SSH/SFTP/npm 导致状态损坏
         self._deploying_ids = set()
         self._deploying_lock = threading.Lock()
-        self._os_cache = {}  # id(client) -> 'windows' | 'linux'
+        # OS 检测缓存已下放到各 Executor 实例（替代原 id(client) 字典）
+
+    def _make_executor(self, server):
+        """根据 server['is_local'] 选执行器：本机用 LocalExecutor，否则 SSH 连接后包装。"""
+        if server.get('is_local'):
+            return LocalExecutor()
+        return SSHExecutor(self._connect(server))
 
     # ──────────────────────────────────────────────────────────
     # 日志
@@ -160,7 +159,7 @@ class AgentDeployManager:
         conn = sqlite3.connect(self.db_file)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        cur.execute('SELECT id, name, server_host, server_port, username, password, cloud_provider, last_deploy_status, deploy_mode FROM ssh_servers ORDER BY id')
+        cur.execute('SELECT id, name, server_host, server_port, username, password, cloud_provider, last_deploy_status, deploy_mode, is_local FROM ssh_servers ORDER BY id')
         rows = [dict(r) for r in cur.fetchall()]
         conn.close()
         return rows
@@ -169,7 +168,7 @@ class AgentDeployManager:
         conn = sqlite3.connect(self.db_file)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        cur.execute('SELECT id, name, server_host, server_port, username, password, cloud_provider, last_deploy_status, deploy_mode FROM ssh_servers WHERE id=?', (server_id,))
+        cur.execute('SELECT id, name, server_host, server_port, username, password, cloud_provider, last_deploy_status, deploy_mode, is_local FROM ssh_servers WHERE id=?', (server_id,))
         row = cur.fetchone()
         conn.close()
         return dict(row) if row else None
@@ -187,7 +186,7 @@ class AgentDeployManager:
         placeholders = ','.join('?' * len(server_ids))
         cur.execute(
             f'SELECT id, name, server_host, server_port, username, password, '
-            f'cloud_provider, last_deploy_status, deploy_mode '
+            f'cloud_provider, last_deploy_status, deploy_mode, is_local '
             f'FROM ssh_servers WHERE id IN ({placeholders})',
             list(server_ids)
         )
@@ -264,97 +263,49 @@ class AgentDeployManager:
             raise last_exc
         raise RuntimeError(f"[{host}] SSH 建连失败：未知原因")
 
-    def _exec(self, client, cmd, timeout=120):
-        """
-        执行命令，返回 (stdout_str, stderr_str, exit_code)。
-        使用轮询替代 recv_exit_status() 的无限阻塞，
-        确保命令超时时线程能正常退出而不是永久挂起。
-        """
-        stdin, stdout, stderr = client.exec_command(cmd)
-        channel = stdout.channel
-        deadline = time.monotonic() + timeout
-        while not channel.exit_status_ready():
-            if time.monotonic() > deadline:
-                channel.close()
-                raise TimeoutError(f"命令超时({timeout}s): {cmd[:80]}")
-            time.sleep(0.5)
-        exit_code = channel.recv_exit_status()
-        out = stdout.read().decode('utf-8', errors='replace').strip()
-        err = stderr.read().decode('utf-8', errors='replace').strip()
-        return out, err, exit_code
+    def _exec(self, ex, cmd, timeout=120):
+        """委托给 Executor 执行命令，返回 (stdout, stderr, exit_code)。
+        ex 可为 SSHExecutor 或 LocalExecutor —— 上层方法体保持不变。"""
+        return ex.exec(cmd, timeout=timeout)
 
-    def _detect_os(self, client):
-        """检测远程服务器操作系统类型，返回 'windows' 或 'linux'（结果按连接缓存）。"""
-        cid = id(client)
-        if cid in self._os_cache:
-            return self._os_cache[cid]
-        out, _, code = self._exec(client, "ver", timeout=5)
-        result = 'windows' if (code == 0 and 'Windows' in out) else 'linux'
-        self._os_cache[cid] = result
-        return result
+    def _detect_os(self, ex):
+        """委托给 Executor 检测 OS，返回 'windows' 或 'linux'（按 executor 实例缓存）。"""
+        return ex.detect_os()
 
-    def _is_cmd_available(self, client, cmd):
+    def _is_cmd_available(self, ex, cmd):
         """检查命令是否可用（exit 0）；兼容 Linux 与 Windows。"""
-        if self._detect_os(client) == 'windows':
-            _, _, code = self._exec(client, f"where {cmd} >nul 2>&1", timeout=10)
+        if self._detect_os(ex) == 'windows':
+            _, _, code = self._exec(ex, f"where {cmd} >nul 2>&1", timeout=10)
         else:
-            _, _, code = self._exec(client, f"command -v {cmd} >/dev/null 2>&1", timeout=10)
+            _, _, code = self._exec(ex, f"command -v {cmd} >/dev/null 2>&1", timeout=10)
         return code == 0
 
-    def _get_cmd_version(self, client, cmd):
+    def _get_cmd_version(self, ex, cmd):
         """获取命令版本号字符串，不可用返回 None"""
-        out, _, code = self._exec(client, f"{cmd} --version 2>/dev/null || {cmd} -v 2>/dev/null", timeout=10)
+        out, _, code = self._exec(ex, f"{cmd} --version 2>/dev/null || {cmd} -v 2>/dev/null", timeout=10)
         return out.strip() if code == 0 and out.strip() else None
 
     # ──────────────────────────────────────────────────────────
-    # SFTP 上传
+    # 文件上传（远端走 SFTP，本地走 shutil；统一经 Executor 原语）
     # ──────────────────────────────────────────────────────────
-    def _sftp_mkdir_p(self, sftp, remote_path):
-        """递归创建远端目录（兼容 Linux /opt/... 和 Windows C:/opt/...）"""
-        # Windows 路径格式：C:/opt/gamyy-agent → 跳过盘符，从 C:/opt 开始创建
-        if len(remote_path) >= 2 and remote_path[1] == ':':
-            parts = remote_path.replace('\\', '/').split('/')
-            if not parts[-1]:
-                parts.pop()
-            for i in range(2, len(parts) + 1):
-                current = '/'.join(parts[:i])
-                try:
-                    sftp.stat(current)
-                except FileNotFoundError:
-                    sftp.mkdir(current)
-            return
-
-        # Linux 路径格式：/opt/gamyy-agent
-        parts = remote_path.rstrip('/').split('/')
-        current = ''
-        for part in parts:
-            if not part:
-                current = '/'
-                continue
-            current = current.rstrip('/') + '/' + part
-            try:
-                sftp.stat(current)
-            except FileNotFoundError:
-                sftp.mkdir(current)
-
-    def _sftp_upload_dir(self, sftp, local_dir, remote_dir, log_prefix=''):
-        """递归上传本地目录到远端"""
-        self._sftp_mkdir_p(sftp, remote_dir)
+    def _upload_dir(self, ex, local_dir, remote_dir):
+        """精简 Agent 模式：递归上传/拷贝目录（跳过 node_modules 与点开头项）。"""
+        ex.mkdirs(remote_dir)
         for item in os.listdir(local_dir):
             if item == 'node_modules' or item.startswith('.'):
                 continue
             local_path = os.path.join(local_dir, item)
             remote_path = remote_dir.rstrip('/') + '/' + item
             if os.path.isdir(local_path):
-                self._sftp_upload_dir(sftp, local_path, remote_path, log_prefix)
+                self._upload_dir(ex, local_path, remote_path)
             else:
-                sftp.put(local_path, remote_path)
+                ex.put_file(local_path, remote_path)
 
-    def _sftp_upload_full_dir(self, sftp, local_dir, remote_dir, source_root):
-        """完整模式专用：按 _should_skip_full 过滤递归上传。
+    def _upload_full_dir(self, ex, local_dir, remote_dir, source_root):
+        """完整模式：按 _should_skip_full 过滤递归上传/拷贝。
         source_root 用于算 rel_path（fnmatch 用），同时供 specific 路径精确匹配。
         """
-        self._sftp_mkdir_p(sftp, remote_dir)
+        ex.mkdirs(remote_dir)
         for item in os.listdir(local_dir):
             local_path = os.path.join(local_dir, item)
             rel = os.path.relpath(local_path, source_root)
@@ -363,64 +314,67 @@ class AgentDeployManager:
                 continue
             remote_path = remote_dir.rstrip('/') + '/' + item
             if is_dir:
-                self._sftp_upload_full_dir(sftp, local_path, remote_path, source_root)
+                self._upload_full_dir(ex, local_path, remote_path, source_root)
             else:
-                sftp.put(local_path, remote_path)
+                ex.put_file(local_path, remote_path)
 
-    def _upload_agent_files(self, client, server_host, source_root=None, mode='agent'):
-        """通过 SFTP 上传文件。
+    def _upload_agent_files(self, ex, server_host, source_root=None, mode='agent'):
+        """上传/部署文件。
         source_root: 部署源根目录（由 get_deploy_source 解析）；None 时回退到 AGENT_SOURCE_DIR
         mode='agent': 精简模式，仅上传 AGENT_UPLOAD_DIRS + package-agent.json→package.json
-        mode='full' : 完整模式，递归上传整个 source_root（按 _should_skip_full 排除）+ 完整 package.json
+        mode='full' : 完整模式，递归整个 source_root（按 _should_skip_full 排除）+ 完整 package.json
+        本地（ex.is_local）只支持 full，走 deploy_local_full（安全清理 + 备份 + copytree）。
         """
         src = source_root or AGENT_SOURCE_DIR
-        is_windows = self._detect_os(client) == 'windows'
-        remote_dir = self._resolve_remote_dir(client, mode)
+        remote_dir = self._resolve_remote_dir(ex, mode)
 
+        # —— 本地部署：整树拷贝（含安全删除 + DB 备份）——
+        if ex.is_local:
+            if not os.path.isfile(os.path.join(src, 'package.json')):
+                self._log(f"[{server_host}] 警告：source 根缺 package.json", 'WARNING')
+            ex.deploy_local_full(src, remote_dir, _should_skip_full, log=self._log)
+            return
+
+        # —— 远端 SFTP 上传 ——
+        is_windows = self._detect_os(ex) == 'windows'
         # 建目录并授权（Linux 需要 sudo；Windows 不需要）
         if is_windows:
             self._exec(
-                client,
+                ex,
                 f"mkdir {remote_dir}\\data 2>nul & mkdir {remote_dir} 2>nul",
                 timeout=15
             )
         else:
             self._exec(
-                client,
+                ex,
                 f"sudo mkdir -p {remote_dir}/data && "
                 f"sudo chown -R $(whoami):$(whoami) {remote_dir}",
                 timeout=30
             )
-        sftp = client.open_sftp()
-        try:
-            self._sftp_mkdir_p(sftp, remote_dir)
+        ex.mkdirs(remote_dir)
 
-            if mode == 'full':
-                # 完整模式：递归整个源根
-                self._sftp_upload_full_dir(sftp, src, remote_dir, src)
-                # package.json 在 source_root 顶层，已被上面的递归上传带上去（除非被排除规则误命中）
-                # 保险起见检测一下
-                if not os.path.isfile(os.path.join(src, 'package.json')):
-                    self._log(f"[{server_host}] 警告：source 根缺 package.json", 'WARNING')
+        if mode == 'full':
+            # 完整模式：递归整个源根
+            self._upload_full_dir(ex, src, remote_dir, src)
+            if not os.path.isfile(os.path.join(src, 'package.json')):
+                self._log(f"[{server_host}] 警告：source 根缺 package.json", 'WARNING')
+        else:
+            # 精简 Agent 模式：保持原逻辑
+            ex.mkdirs(remote_dir + '/data')
+            for d in AGENT_UPLOAD_DIRS:
+                local_d = os.path.join(src, d)
+                if not os.path.isdir(local_d):
+                    self._log(f"[{server_host}] 警告：本地目录不存在 {local_d}", 'WARNING')
+                    continue
+                remote_d = remote_dir + '/' + d
+                self._upload_dir(ex, local_d, remote_d)
+
+            # 上传 package-agent.json → package.json
+            pkg_local = os.path.join(src, AGENT_PACKAGE_FILE)
+            if os.path.isfile(pkg_local):
+                ex.put_file(pkg_local, remote_dir + '/package.json')
             else:
-                # 精简 Agent 模式：保持原逻辑
-                self._sftp_mkdir_p(sftp, remote_dir + '/data')
-                for d in AGENT_UPLOAD_DIRS:
-                    local_d = os.path.join(src, d)
-                    if not os.path.isdir(local_d):
-                        self._log(f"[{server_host}] 警告：本地目录不存在 {local_d}", 'WARNING')
-                        continue
-                    remote_d = remote_dir + '/' + d
-                    self._sftp_upload_dir(sftp, local_d, remote_d)
-
-                # 上传 package-agent.json → package.json
-                pkg_local = os.path.join(src, AGENT_PACKAGE_FILE)
-                if os.path.isfile(pkg_local):
-                    sftp.put(pkg_local, remote_dir + '/package.json')
-                else:
-                    self._log(f"[{server_host}] 警告：找不到 {pkg_local}", 'WARNING')
-        finally:
-            sftp.close()
+                self._log(f"[{server_host}] 警告：找不到 {pkg_local}", 'WARNING')
 
     # ──────────────────────────────────────────────────────────
     # 环境检测与安装（跳过已安装）
@@ -445,11 +399,9 @@ class AgentDeployManager:
         url = _MIRRORS.get(cloud, _MIRRORS['default'])['npm']
         return f"--registry={url} " if url else ""
 
-    def _resolve_remote_dir(self, client, mode='agent'):
-        """根据远程 OS 返回部署目录：Linux /opt/...，Windows C:\opt\..."""
-        if self._detect_os(client) == 'windows':
-            return AGENT_WINDOWS_FULL_REMOTE_DIR if mode == 'full' else AGENT_WINDOWS_REMOTE_DIR
-        return AGENT_FULL_REMOTE_DIR if mode == 'full' else AGENT_REMOTE_DIR
+    def _resolve_remote_dir(self, ex, mode='agent'):
+        """委托给 Executor：远端 Linux /opt/... 或 Windows C:/opt/...；本地 LOCAL_DEPLOY_DIR。"""
+        return ex.resolve_dir(mode)
 
     def _ensure_nodejs(self, client, server_host, cloud='default'):
         """确保 Node.js >= 18，不满足则安装 Node.js 22。
@@ -462,13 +414,21 @@ class AgentDeployManager:
         is_windows = self._detect_os(client) == 'windows'
 
         # --- 版本检测（兼容 Windows cmd.exe 和 Linux bash）---
-        detect_cmd = "node -v 2>nul || echo NOT_FOUND" if is_windows else "node -v 2>/dev/null || echo NOT_FOUND"
+        # Windows: 同名会话 PATH 可能未刷新（刚装完 MSI），显式检查默认安装路径
+        detect_cmd = (r'(node -v 2>nul) || ("%ProgramFiles%\nodejs\node" -v 2>nul) || echo NOT_FOUND') if is_windows else "node -v 2>/dev/null || echo NOT_FOUND"
         out, _, code = self._exec(client, detect_cmd, timeout=10)
         if code == 0 and out.startswith('v'):
             major = int(out.lstrip('v').split('.')[0])
             if major >= 18:
                 self._log(f"[{server_host}] Node.js {out} 已安装，跳过", 'INFO')
                 return True
+
+        # 本地部署：只检测不自动安装（不在用户机上静默装 MSI），缺则报错引导手动安装
+        if getattr(client, 'is_local', False):
+            raise RuntimeError(
+                "本机未检测到 Node.js >= 18。请先安装 Node.js 22 LTS 后重试："
+                "https://nodejs.org/en/download"
+            )
 
         # --- 安装命令（Windows vs Linux）---
         if is_windows:
@@ -536,7 +496,10 @@ class AgentDeployManager:
         raise RuntimeError(f"Node.js 安装失败（已尝试 {max_attempts} 次）：{last_reason}")
 
     def _ensure_pm2(self, client, server_host, cloud='default'):
-        """确保 PM2 已安装（Windows 上不使用 PM2，直接跳过）。"""
+        """确保 PM2 已安装（Windows 上 / 本地部署不使用 PM2，直接跳过）。"""
+        if getattr(client, 'is_local', False):
+            self._log(f"[{server_host}] 本地部署，跳过 PM2（用 node 直接后台启动）", 'INFO')
+            return True
         if self._detect_os(client) == 'windows':
             self._log(f"[{server_host}] Windows 环境，跳过 PM2（使用 node 直接启动）", 'INFO')
             return True
@@ -588,6 +551,7 @@ class AgentDeployManager:
                 f"cd /d {remote_dir} && "
                 "rmdir /s /q node_modules 2>nul & "
                 "del package-lock.json 2>nul & "
+                r'set "PATH=%ProgramFiles%\nodejs;%PATH%" && '
                 f"set NODE_OPTIONS=--max-old-space-size=512 && "
                 f"npm install {registry}--omit=dev --legacy-peer-deps 2>&1"
             )
@@ -628,7 +592,11 @@ class AgentDeployManager:
 
         Linux: apt-get / yum 安装 build-essential + libsqlite3-dev。
         Windows: 跳过（better-sqlite3/sqlite3 有预编译二进制，无需编译工具）。
+        本地部署：跳过（不在用户机上装系统编译链）。
         """
+        if getattr(client, 'is_local', False):
+            self._log(f"[{server_host}] 本地部署，跳过编译工具安装（用预编译原生模块）", 'INFO')
+            return
         if self._detect_os(client) == 'windows':
             self._log(f"[{server_host}] Windows 环境，跳过编译工具安装（使用预编译原生模块）", 'INFO')
             return
@@ -696,6 +664,8 @@ class AgentDeployManager:
 
     def _resolve_cloud(self, server, client, host):
         """获取该服务器的云厂商：'auto' 时探测并写回 DB；其它直接返回。"""
+        if getattr(client, 'is_local', False):
+            return 'default'  # 本机无云厂商，直接 default（不走 metadata 探测）
         cp = (server.get('cloud_provider') or 'auto').strip().lower()
         if cp not in ('auto', 'aliyun', 'tencent', 'default'):
             cp = 'auto'
@@ -710,7 +680,7 @@ class AgentDeployManager:
         # 缓存到 DB（即使是 'default' 也写回，避免每次都探）
         try:
             from database import ProxyDatabase
-            ProxyDatabase().update_server_cloud_provider(server['id'], detected)
+            ProxyDatabase(self.db_file).update_server_cloud_provider(server['id'], detected)
         except Exception as e:
             self._log(f"[{host}] 云厂商写回 DB 失败（已忽略）: {e}", 'WARNING')
         self._log(f"[{host}] 云厂商探测结果: {detected}", 'INFO')
@@ -802,9 +772,9 @@ class AgentDeployManager:
                 return {'ok': False, 'msg': '找不到部署源', 'status': None}
             self._log(f"[{host}] 使用部署源：{source_kind} ({source_root})", 'INFO')
 
-            self._step(step_cb, '连接SSH...')
+            self._step(step_cb, '连接本机...' if server.get('is_local') else '连接SSH...')
             self._log(f"[{host}] 开始部署（mode={mode}）...", 'INFO')
-            client = self._connect(server)
+            client = self._make_executor(server)
 
             self._step(step_cb, '探测云厂商...')
             cloud = self._resolve_cloud(server, client, host)
@@ -867,16 +837,22 @@ class AgentDeployManager:
     def _write_deploy_status(self, server, status, mode=None):
         """部署完成后把结果写回 ssh_servers。
 
-        status='success' + mode → 追加 mode 到 deploy_mode（逗号分隔去重）
-        status='failed'         → 只写 status，不动 deploy_mode
+        deploy_mode 只在部署成功时写入：
+        - 如果该服务器之前从未成功部署过 → 直接设为当前 mode（避免被 DB 默认值 'agent' 污染）
+        - 如果已有其他 mode 部署成功 → 追加当前 mode（逗号分隔去重，如 'agent,full'）
+        status='failed' → 只写 status，不动 deploy_mode
         """
         try:
             from database import ProxyDatabase
-            db = ProxyDatabase()
+            db = ProxyDatabase(self.db_file)
             db.update_server_deploy_status(server['id'], status)
             if mode and status == 'success':
-                current = (server.get('deploy_mode') or 'agent').strip()
+                current = (server.get('deploy_mode') or '').strip()
                 modes = set(m.strip() for m in current.split(',') if m.strip())
+                # 如果之前从未部署成功过，说明 current 只是 DB 默认值（如 'agent'），应直接覆盖
+                prev_status = server.get('last_deploy_status', 'never')
+                if prev_status != 'success':
+                    modes = set()
                 modes.add(mode)
                 new_mode = ','.join(sorted(modes))
                 db.update_server_deploy_mode(server['id'], new_mode)
@@ -886,17 +862,19 @@ class AgentDeployManager:
 
     @staticmethod
     def _get_modes(server):
-        """解析 deploy_mode 为 mode 列表，默认 ['agent']"""
-        raw = (server.get('deploy_mode') or 'agent').strip()
+        """解析 deploy_mode 为 mode 列表。空字符串返回空列表。"""
+        raw = (server.get('deploy_mode') or '').strip()
         return [m.strip() for m in raw.split(',') if m.strip()]
 
     def start_server(self, server, step_cb=None):
         host = server['server_host']
         modes = self._get_modes(server)
+        if not modes:
+            return {'ok': True, 'msg': '未部署（无可启动模式）', 'status': {'pm2': '—', 'health': False, 'uptime': None, 'running_tasks': None}}
         client = None
         try:
-            self._step(step_cb, '连接SSH...')
-            client = self._connect(server)
+            self._step(step_cb, '连接本机...' if server.get('is_local') else '连接SSH...')
+            client = self._make_executor(server)
             for mode in modes:
                 self._step(step_cb, f'启动 {mode}...')
                 self._pm2_start_or_restart(client, host, mode=mode)
@@ -922,13 +900,18 @@ class AgentDeployManager:
         modes = self._get_modes(server)
         client = None
         try:
-            self._step(step_cb, '连接SSH...')
-            client = self._connect(server)
+            self._step(step_cb, '连接本机...' if server.get('is_local') else '连接SSH...')
+            client = self._make_executor(server)
             is_windows = self._detect_os(client) == 'windows'
             for mode in modes:
                 port = AGENT_FULL_PORT if mode == 'full' else AGENT_PORT
                 pm2_name = AGENT_FULL_PM2_NAME if mode == 'full' else AGENT_PM2_NAME
-                if is_windows:
+                if client.is_local:
+                    # 本地：按端口杀进程（不走 pm2）
+                    self._step(step_cb, f'停止 {mode} (端口 {port})...')
+                    client.stop_port(port)
+                    self._log(f"[{host}] 已停止端口 {port} ({mode})", 'INFO')
+                elif is_windows:
                     self._step(step_cb, f'停止 {mode} (端口 {port})...')
                     self._exec(client,
                         f"for /f \"tokens=5\" %p in ('netstat -ano 2^>nul ^| findstr :{port} ^| findstr LISTENING') do @taskkill /f /pid %p >nul 2>&1",
@@ -954,14 +937,20 @@ class AgentDeployManager:
     def restart_server(self, server, step_cb=None):
         host = server['server_host']
         modes = self._get_modes(server)
+        if not modes:
+            return {'ok': True, 'msg': '未部署（无可重启模式）', 'status': {'pm2': '—', 'health': False, 'uptime': None, 'running_tasks': None}}
         client = None
         try:
-            self._step(step_cb, '连接SSH...')
-            client = self._connect(server)
+            self._step(step_cb, '连接本机...' if server.get('is_local') else '连接SSH...')
+            client = self._make_executor(server)
             is_windows = self._detect_os(client) == 'windows'
             for mode in modes:
                 port = AGENT_FULL_PORT if mode == 'full' else AGENT_PORT
-                if is_windows:
+                if client.is_local:
+                    self._step(step_cb, f'停止旧进程 {mode} (端口 {port})...')
+                    client.stop_port(port)
+                    time.sleep(1)
+                elif is_windows:
                     self._step(step_cb, f'停止旧进程 {mode} (端口 {port})...')
                     self._exec(client,
                         f"for /f \"tokens=5\" %p in ('netstat -ano 2^>nul ^| findstr :{port} ^| findstr LISTENING') do @taskkill /f /pid %p >nul 2>&1",
@@ -992,7 +981,7 @@ class AgentDeployManager:
         modes = self._get_modes(server)
         client = None
         try:
-            client = self._connect(server, timeout=8)
+            client = self._make_executor(server)
             is_windows = self._detect_os(client) == 'windows'
             merged_pm2 = 'not_found'
             merged_health = False
@@ -1001,7 +990,20 @@ class AgentDeployManager:
             for mode in modes:
                 port = AGENT_FULL_PORT if mode == 'full' else AGENT_PORT
                 pm2_name = AGENT_FULL_PM2_NAME if mode == 'full' else AGENT_PM2_NAME
-                if is_windows:
+                if client.is_local:
+                    # 本地：按端口判 online + HTTP 健康
+                    listening = client.is_listening(port)
+                    pm2_status = 'online' if listening else 'stopped'
+                    if is_windows:
+                        health_cmd = (
+                            f"powershell -Command \"try {{ "
+                            f"$r=Invoke-WebRequest -Uri 'http://localhost:{port}/health' "
+                            f"-UseBasicParsing -TimeoutSec 3; Write-Host $r.Content "
+                            f"}} catch {{ Write-Host 'FAIL' }}\""
+                        )
+                    else:
+                        health_cmd = f"curl -sf --max-time 3 http://localhost:{port}/health 2>/dev/null || echo FAIL"
+                elif is_windows:
                     out, _, code = self._exec(client,
                         f"netstat -ano 2>nul | findstr :{port} | findstr LISTENING >nul && echo online || echo stopped",
                         timeout=15)
@@ -1056,7 +1058,10 @@ class AgentDeployManager:
         host = server['server_host']
         client = None
         try:
-            client = self._connect(server)
+            client = self._make_executor(server)
+            if client.is_local:
+                # 本地：读 server.log 末尾
+                return client.read_log_tail(lines)
             out, err, _ = self._exec(
                 client,
                 f"pm2 logs {AGENT_PM2_NAME} --lines {lines} --nostream 2>&1",
@@ -1078,6 +1083,9 @@ class AgentDeployManager:
         返回 (ok, local_path_or_error_msg)
         """
         host = server['server_host']
+        if server.get('is_local'):
+            # 本机日志DB就在本地 LOCAL_DEPLOY_DIR/data 下，无需下载
+            return False, '本机无需下载日志DB（数据就在本地部署目录 data/ 下）'
         save_dir = local_dir or AGENT_LOG_SAVE_DIR
         os.makedirs(save_dir, exist_ok=True)
 
@@ -1274,6 +1282,7 @@ class AgentDeployManager:
     def _pm2_start_or_restart(self, client, host, mode='agent'):
         """启动/重启服务进程。
 
+        本地: subprocess.Popen 后台 node（脱离父进程）
         Linux: PM2 管理
         Windows: PowerShell Start-Process 后台启动（PM2 在 Windows 上不稳定）
         """
@@ -1289,6 +1298,20 @@ class AgentDeployManager:
             port = AGENT_PORT
         remote_dir = self._resolve_remote_dir(client, mode)
 
+        if client.is_local:
+            # --- 本地：原生 subprocess 后台启动 node ---
+            client.stop_port(port)          # 先杀旧进程（kill-before-start）
+            time.sleep(1)
+            log_path = os.path.join(remote_dir, 'server.log')
+            pid = client.start_node(remote_dir, entry_script, log_path)
+            self._log(f"[{host}] 本地后台启动 node {entry_script} (PID={pid})", 'INFO')
+            time.sleep(3)
+            if client.is_listening(port):
+                self._log(f"[{host}] 服务启动成功 ✅（端口 {port} 已监听）", 'SUCCESS')
+            else:
+                self._log(f"[{host}] 端口 {port} 未监听，检查 {log_path}", 'WARNING')
+            return
+
         if is_windows:
             # --- Windows: 直接 node 后台进程 ---
             # 1. 杀掉旧进程（按端口）
@@ -1302,8 +1325,10 @@ class AgentDeployManager:
             log_out = remote_dir + "\\server.log"
             bat_file = remote_dir + "\\start-server.bat"
             # 用 cmd echo 写启动脚本（^> ^& 转义避免过早重定向）
+            # %ProgramFiles% 和 %PATH% 由远程 cmd 在 echo 前展开 → bat 里得到具体路径
             write_cmd = (
                 f"echo @echo off > {bat_file} & "
+                r'echo set "PATH=%ProgramFiles%\nodejs;%PATH%" >> ' + f"{bat_file} & "
                 f"echo cd /d {remote_dir} >> {bat_file} & "
                 f"echo node {entry_script} ^> {log_out} 2^>^&1 >> {bat_file}"
             )

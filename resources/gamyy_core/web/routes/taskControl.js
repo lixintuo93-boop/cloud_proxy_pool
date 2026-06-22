@@ -145,8 +145,6 @@ router.post('/:id/start', async (req, res) => {
           checkRequest:       proxyCfg.checkRequest,
           lockRequest:        proxyCfg.lockRequest,
           channelBuildPhase1: proxyCfg.channelBuildPhase1,
-          // TLS 指纹（代理级）：account/HttpClient 经 sidecar 时按 cfg.fingerprint 选指纹
-          fingerprint:        proxyCfg.fingerprint,
           // 心跳/keepAlive 下沉到代理级：connectionChannel 优先按 cfg.keepAlive 读取
           keepAlive:          proxyCfg.keepAlive,
           heartbeatTimeout:   proxyCfg.timeout?.heartbeatTimeout,

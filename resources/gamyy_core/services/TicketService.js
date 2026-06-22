@@ -4,7 +4,6 @@ const RequestLog = require('../models/RequestLog');
 const LockRequestLog = require('../models/lockRequestLog');
 const LogDatabase = require('../database/logDb');
 const ConnectionPool = require('./connectionPool');
-const sidecar = require('./sidecarClient');
 
 const SubmitSignPool = require('./SubmitSignPool');
 
@@ -661,6 +660,61 @@ class TicketService {
   }
 
   /**
+   * 🆕 判断查号响应中"目标医生+目标日期"是否已全面售罄
+   * — 响应中存在目标医生+目标日期的 plan，且全部 remainNum=0
+   *
+   * 与 isPlanIdExhausted（单个 plan 级）不同，本方法判断的是：
+   * "该代理的目标（医生+日期）在服务器侧是否无任何余票"。
+   *
+   * @param {object} responseData  查号响应
+   * @param {object} account       账号对象（含 doctorCode、lockPlanDate）
+   * @param {'doctor'|'dept'} mode 查号模式
+   * @returns {{ hasTargetPlans: boolean, allZero: boolean }}
+   */
+  isTargetExhausted(responseData, account, mode) {
+    if (!responseData || !responseData.value || !Array.isArray(responseData.value)) {
+      return { hasTargetPlans: false, allZero: false };
+    }
+
+    const filterDoctorCode = account?.doctorCode || null;
+    const filterPlanDate  = account?.lockPlanDate || null;
+
+    let targetPlanCount = 0;
+    let zeroCount       = 0;
+
+    const processPlan = (plan, doctorCode) => {
+      if (filterDoctorCode && doctorCode !== filterDoctorCode) return;
+      if (filterPlanDate  && plan.date   !== filterPlanDate)  return;
+      targetPlanCount++;
+      if (plan.remainNum === 0) zeroCount++;
+    };
+
+    if (mode === 'dept') {
+      for (const registerType of responseData.value) {
+        if (!registerType.doctorList || !Array.isArray(registerType.doctorList)) continue;
+        for (const doctor of registerType.doctorList) {
+          if (!doctor.planList || !Array.isArray(doctor.planList)) continue;
+          for (const plan of doctor.planList) {
+            processPlan(plan, doctor.doctorCode);
+          }
+        }
+      }
+    } else {
+      for (const dept of responseData.value) {
+        if (!dept.planList || !Array.isArray(dept.planList)) continue;
+        for (const plan of dept.planList) {
+          processPlan(plan, plan.doctorCode);
+        }
+      }
+    }
+
+    return {
+      hasTargetPlans: targetPlanCount > 0,
+      allZero:        targetPlanCount > 0 && zeroCount === targetPlanCount,
+    };
+  }
+
+  /**
    * 检查响应是否表示"号源已无余票"
    * 兼容两种格式：
    *   旧格式：{ code:0, msg:"...没有可以预约的号了..." }
@@ -1102,6 +1156,13 @@ class TicketService {
           this.updateSlotExhaustionFromCheck(responseData, account, 'doctor');
           const allTickets = hasTicket ? this.getAllAvailableTicketsByDoctor(responseData, account) : [];
           const ticketDetails = allTickets[0] || null;
+          const targetExhausted = !hasTicket && this.isTargetExhausted(responseData, account, 'doctor').allZero;
+
+          if (targetExhausted) {
+            this.printEventLog(
+              `🚫 [${this.formatTime()}] 目标售罄: 医生 ${account.doctorCode}, 日期 ${account.lockPlanDate}, 代理 ${proxyKey}, 所有号源余票均为0`
+            );
+          }
 
           if (hasTicket) {
             const logMessages = [`\n🎯🎯🎯 [${this.formatTime()}] 发现余票！账号ID: ${accountId}, 手机: ${account.mobile}, 代理: ${proxyKey}`];
@@ -1121,7 +1182,7 @@ class TicketService {
           }
 
           return {
-            success: true, hasTicket, ticketDetails, allTickets, data: responseData,
+            success: true, hasTicket, targetExhausted, ticketDetails, allTickets, data: responseData,
             submitSign: foundSubmitSign, cookie: foundCookie, submitSignSource: channelId, statusCode,
             requestType: 'check', requestId
           };
@@ -1129,7 +1190,7 @@ class TicketService {
 
         this.incrementCheckStats(accountId, false, proxyKey, statusCode);
         return {
-          success: result.success, hasTicket: false, statusCode,
+          success: result.success, hasTicket: false, targetExhausted: false, statusCode,
           submitSign: foundSubmitSign, cookie: foundCookie, submitSignSource: channelId, error: errorMsg,
           requestType: 'check', requestId
         };
@@ -1139,7 +1200,7 @@ class TicketService {
       const errorMsg = this.buildErrorMessage(result, '查号请求失败');
       await saveLogOnce(result.statusCode || 0, null, errorMsg, foundSubmitSign, null, requestHeaders);
       return {
-        success: false, hasTicket: false, statusCode: result.statusCode || 0, error: errorMsg,
+        success: false, hasTicket: false, targetExhausted: false, statusCode: result.statusCode || 0, error: errorMsg,
         submitSignSource: channelId, cookie: '',
         requestType: 'check', requestId
       };
@@ -1148,7 +1209,7 @@ class TicketService {
       // 🔑 检查请求是否被取消，如果被取消则返回cancelled标记
       if (error && error.cancelled) {
         return {
-          success: false, hasTicket: false, error: '请求被取消',
+          success: false, hasTicket: false, targetExhausted: false, error: '请求被取消',
           statusCode: 0, cancelled: true, cookie: '',
           requestType: error.requestType || 'check', requestId: error.requestId || requestId
         };
@@ -1157,8 +1218,8 @@ class TicketService {
       this.incrementCheckStats(accountId, false, proxyKey, error.statusCode || 0);
       const errorMsg = this.buildErrorMessage(error, '查号异常');
       await saveLogOnce(error.statusCode || 0, null, errorMsg, foundSubmitSign, null, requestHeaders);
-      return { 
-        success: false, hasTicket: false, error: errorMsg, statusCode: error.statusCode || 0, cookie: '',
+      return {
+        success: false, hasTicket: false, targetExhausted: false, error: errorMsg, statusCode: error.statusCode || 0, cookie: '',
         requestType: error.requestType || 'check', requestId: error.requestId || requestId
       };
     }
@@ -1324,6 +1385,13 @@ class TicketService {
           this.updateSlotExhaustionFromCheck(responseData, account, 'dept');
           const allTickets = hasTicket ? this.getAllAvailableTicketsByDept(responseData, account) : [];
           const ticketDetails = allTickets[0] || null;
+          const targetExhausted = !hasTicket && this.isTargetExhausted(responseData, account, 'dept').allZero;
+
+          if (targetExhausted) {
+            this.printEventLog(
+              `🚫 [${this.formatTime()}] 目标售罄: 医生 ${account.doctorCode}, 日期 ${account.lockPlanDate}, 代理 ${proxyKey}, 所有号源余票均为0`
+            );
+          }
 
           if (submitSignPoolId && ticketDetails?.date) {
             this.submitSignPool.updateSlotDate(submitSignPoolId, ticketDetails.date);
@@ -1345,15 +1413,15 @@ class TicketService {
           }
 
           return {
-            success: true, hasTicket, ticketDetails, allTickets, data: responseData,
+            success: true, hasTicket, targetExhausted, ticketDetails, allTickets, data: responseData,
             submitSign: foundSubmitSign, cookie: foundCookie, submitSignSource: channelId, statusCode,
             requestType: 'check', requestId
           };
         }
-        
+
         this.incrementCheckStats(accountId, false, proxyKey, statusCode);
         return {
-          success: result.success, hasTicket: false, statusCode,
+          success: result.success, hasTicket: false, targetExhausted: false, statusCode,
           submitSign: foundSubmitSign, cookie: foundCookie, submitSignSource: channelId, error: errorMsg,
           requestType: 'check', requestId
         };
@@ -1363,7 +1431,7 @@ class TicketService {
       const errorMsg = this.buildErrorMessage(result, '查号请求失败');
       await saveLogOnce(result.statusCode || 0, null, errorMsg, foundSubmitSign, null, requestHeaders);
       return {
-        success: false, hasTicket: false, statusCode: result.statusCode || 0, error: errorMsg,
+        success: false, hasTicket: false, targetExhausted: false, statusCode: result.statusCode || 0, error: errorMsg,
         submitSignSource: channelId, cookie: '',
         requestType: 'check', requestId
       };
@@ -1372,7 +1440,7 @@ class TicketService {
       // 🔑 检查请求是否被取消，如果被取消则返回cancelled标记
       if (error && error.cancelled) {
         return {
-          success: false, hasTicket: false, error: '请求被取消',
+          success: false, hasTicket: false, targetExhausted: false, error: '请求被取消',
           statusCode: 0, cancelled: true, cookie: '',
           requestType: error.requestType || 'check', requestId: error.requestId || requestId
         };
@@ -1381,8 +1449,8 @@ class TicketService {
       this.incrementCheckStats(accountId, false, proxyKey, error.statusCode || 0);
       const errorMsg = this.buildErrorMessage(error, '查号异常');
       await saveLogOnce(error.statusCode || 0, null, errorMsg, foundSubmitSign, null, requestHeaders);
-      return { 
-        success: false, hasTicket: false, error: errorMsg, statusCode: error.statusCode || 0,
+      return {
+        success: false, hasTicket: false, targetExhausted: false, error: errorMsg, statusCode: error.statusCode || 0,
         submitSignSource: channelId, cookie: '',
         requestType: error.requestType || 'check', requestId: error.requestId || requestId
       };
@@ -1567,7 +1635,7 @@ class TicketService {
         }
         
         // 🆕 检测"已预约该日期该科室"（说明账号已经预约成功了，只是之前没收到响应）
-        if (responseData && responseData.msg && (responseData.msg.includes('已预约') || responseData.msg.includes('已经预约'))) {
+        if (responseData && responseData.msg && responseData.msg.includes('已预约') || responseData.msg.includes('已经预约')) {
           this.printEventLog(
             `\n🎉 [${this.formatTime()}] 检测到账号已预约成功（之前未收到响应）`,
             `   账号: ${account.mobile}`,
@@ -1736,55 +1804,54 @@ class TicketService {
       // 获取目标主机
       const targetHosts = this.config.connectionPool.targetHosts;
       const targetHost = targetHosts[Math.floor(Math.random() * targetHosts.length)];
-      const sni = 'hlwyl.gamyy.cn';
 
-      // 建连：与 connectionChannel.attemptConnect() 对齐的三分支
-      // 1) sidecar 模式：经 fp-sidecar 隧道（带 TLS 指纹），隧道内走明文
-      // 2) 直连出口（proxyType==='direct'）：绕过 SOCKS，net 直连
-      // 3) 标准 SOCKS 代理
-      const connectTimeout = this.config.timeout.connectTimeout;
-      const waitSecure = (s) => new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error('TLS握手超时')), connectTimeout);
-        s.on('secureConnect', () => { clearTimeout(timer); resolve(); });
-        s.on('error', (error) => { clearTimeout(timer); reject(error); });
-      });
-
-      if (sidecar.SIDECAR_ADDR) {
-        // sidecar：隧道明文 socket 即作 tlsSocket（write 明文 HTTP，由 sidecar 用指纹加密）
-        const fpHeader = sidecar.buildFingerprintHeader(
-          proxyConfig.cfg && proxyConfig.cfg.fingerprint,
-          sni
-        );
-        const upstream = proxyConfig.proxyType === 'direct' ? '' : sidecar.buildSocksUrl(proxyConfig);
-        const tunnel = await sidecar.establishTunnel(
-          `${targetHost.host}:${targetHost.port}`,
-          fpHeader, upstream, connectTimeout
-        );
-        socket = tunnel;
-        tlsSocket = tunnel;
-      } else if (proxyConfig.proxyType === 'direct') {
-        // 直连出口：net 直连目标，再本地 TLS 握手
+      // 创建底层 TCP 连接：直连模式绕过 SOCKS，直接 TCP；否则经 SOCKS5 代理
+      // 与 ConnectionChannel.attemptConnect() 的 proxyType 分支逻辑一致
+      if (proxyConfig.proxyType === 'direct') {
         const net = require('net');
         socket = await new Promise((resolve, reject) => {
           const sock = net.createConnection({ host: targetHost.host, port: targetHost.port });
-          const timer = setTimeout(() => { sock.destroy(); reject(new Error('直连TCP超时')); }, connectTimeout);
-          sock.on('connect', () => { clearTimeout(timer); resolve(sock); });
-          sock.on('error', (e) => { clearTimeout(timer); reject(e); });
+          const sockTimer = setTimeout(() => {
+            sock.destroy();
+            reject(new Error(`直连TCP超时(${this.config.timeout.connectTimeout}ms)`));
+          }, this.config.timeout.connectTimeout);
+          sock.on('connect', () => { clearTimeout(sockTimer); resolve(sock); });
+          sock.on('error', (e) => { clearTimeout(sockTimer); reject(e); });
         });
-        tlsSocket = tls.connect({ socket, host: sni, servername: sni, rejectUnauthorized: false });
-        await waitSecure(tlsSocket);
       } else {
-        // 标准 SOCKS 代理
         const socksResult = await SocksClient.createConnection({
           proxy: proxyConfig,
           destination: { host: targetHost.host, port: targetHost.port },
           command: 'connect',
-          timeout: connectTimeout
+          timeout: this.config.timeout.connectTimeout
         });
         socket = socksResult.socket;
-        tlsSocket = tls.connect({ socket, host: sni, servername: sni, rejectUnauthorized: false });
-        await waitSecure(tlsSocket);
       }
+
+      // 创建TLS连接
+      tlsSocket = tls.connect({
+        socket: socket,
+        host: 'hlwyl.gamyy.cn',
+        servername: 'hlwyl.gamyy.cn',
+        rejectUnauthorized: false
+      });
+
+      // 等待TLS握手完成
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error('TLS握手超时'));
+        }, this.config.timeout.connectTimeout);
+
+        tlsSocket.on('secureConnect', () => {
+          clearTimeout(timeout);
+          resolve();
+        });
+
+        tlsSocket.on('error', (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        });
+      });
 
       // 发送请求并等待响应
       const responseText = await new Promise((resolve, reject) => {
@@ -1913,7 +1980,7 @@ class TicketService {
       }
 
       // 🆕 检测"已预约该日期该科室"（说明账号已经预约成功了，只是之前没收到响应）
-      if (responseData && responseData.msg && (responseData.msg.includes('已预约') || responseData.msg.includes('已经预约'))) {
+      if (responseData && responseData.msg && responseData.msg.includes('已预约') || responseData.msg.includes('已经预约')) {
         this.printEventLog(
           `\n🎉 [${this.formatTime()}] 检测到账号已预约成功（直接请求，之前未收到响应）`,
           `   账号: ${account.mobile}`,
@@ -2091,7 +2158,7 @@ class TicketService {
   }
 
   /**
-   * 返回按部门查号响应中所有可用号源（按医生优先级升序排列，用于售罄后切换备选）
+   * 返回按部门查号响应中所有可用号源（按医生优先级 → 费用升序排列，同医生选便宜的）
    */
   getAllAvailableTicketsByDept(responseData, account) {
     if (!responseData.value || !Array.isArray(responseData.value)) return [];
@@ -2128,7 +2195,7 @@ class TicketService {
         }
       }
     }
-    tickets.sort((a, b) => a.priority - b.priority);
+    tickets.sort((a, b) => a.priority - b.priority || parseInt(a.fee) - parseInt(b.fee));
     return tickets;
   }
 
@@ -2160,8 +2227,8 @@ class TicketService {
   }
 
   /**
-   * 从按部门查询的响应中根据优先级选择号源
-   * 按账号配置的 doctorCode 和 lockPlanDate 精确过滤，取优先级最高的号源
+   * 从按部门查询的响应中根据优先级+费用选择号源
+   * 按账号配置的 doctorCode 和 lockPlanDate 精确过滤，同医生号源优先选便宜的
    */
   getRandomAvailableTicketByDept(responseData, account) {
     if (!responseData.value || !Array.isArray(responseData.value)) return null;
@@ -2204,11 +2271,11 @@ class TicketService {
 
     if (availableTickets.length === 0) return null;
 
-    // 按优先级排序，取优先级最高的号源
-    availableTickets.sort((a, b) => a.priority - b.priority);
+    // 按优先级 → 费用升序：同医生号源选最便宜的
+    availableTickets.sort((a, b) => a.priority - b.priority || parseInt(a.fee) - parseInt(b.fee));
     const selectedTicket = availableTickets[0];
 
-    console.log(`📊 [${this.formatTime()}] 按优先级选号: 共${availableTickets.length}个可用号源`);
+    console.log(`📊 [${this.formatTime()}] 按优先级+费用选号: 共${availableTickets.length}个可用号源`);
     console.log(`   选中: ${selectedTicket.doctorName} (优先级${selectedTicket.priority})`);
 
     return selectedTicket;
