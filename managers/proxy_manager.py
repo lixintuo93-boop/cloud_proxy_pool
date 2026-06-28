@@ -4,6 +4,7 @@
 - 自动恢复成功后也启动流量监控
 - 服务器不可达时给出明确提示
 """
+import re
 import threading
 import time
 import os
@@ -630,14 +631,25 @@ class ProxyManager:
         # 串行端口分配（确保 used_ports 一致性 + bind 测试结果及时反映到下一次搜索）
         with self._port_alloc_lock:
             for i, host in enumerate(hosts):
-                # 解析主机信息
-                parts = host.split()
-                if len(parts) >= 3:
-                    host_ip, user, pwd = parts[0], parts[1], parts[2]
-                elif len(parts) == 1:
-                    host_ip, user, pwd = parts[0], username, password
+                # 解析主机信息 —— 优先从行中自动识别 IP（兼容腾讯云 CSV 等格式）
+                ip_match = re.search(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', host)
+                if ip_match:
+                    host_ip = ip_match.group(0)
+                    # 剩余部分按空白 split 找用户名/密码
+                    rest = host.replace(host_ip, '', 1).split()
+                    if len(rest) >= 2:
+                        user, pwd = rest[0], rest[1]
+                    else:
+                        user, pwd = username, password
                 else:
-                    host_ip, user, pwd = host, username, password
+                    # 回退：按空白分隔解析
+                    parts = host.split()
+                    if len(parts) >= 3:
+                        host_ip, user, pwd = parts[0], parts[1], parts[2]
+                    elif len(parts) == 1:
+                        host_ip, user, pwd = parts[0], username, password
+                    else:
+                        host_ip, user, pwd = host, username, password
 
                 # 处理 IP:端口 格式
                 if ':' in host_ip:

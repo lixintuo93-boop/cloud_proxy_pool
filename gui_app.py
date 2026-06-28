@@ -150,7 +150,7 @@ class BatchAddDialog(tk.Toplevel):
         ttk.Label(cloud_row, text="(部署时按此选择 npm/Node.js 镜像)", foreground="gray").pack(side=tk.LEFT, padx=10)
 
         ttk.Label(main_frame, text="输入服务器IP（每行一个）:").pack(anchor=tk.W)
-        ttk.Label(main_frame, text="格式: IP  （用上方统一凭据）  或  IP 用户名 密码  （本行覆盖上方凭据）",
+        ttk.Label(main_frame, text="格式: IP  /  IP 用户名 密码  /  腾讯云CSV(ins-xxx,名称,IP)，自动识别IP",
                   foreground="gray").pack(anchor=tk.W)
 
         self.text_input = scrolledtext.ScrolledText(main_frame, height=12)
@@ -1152,15 +1152,46 @@ class ProxyManagerGUI:
         self.select_count_label = ttk.Label(select_frame, text="已选: 0", foreground="blue")
         self.select_count_label.pack(side=tk.LEFT, padx=10)
 
-        # 组筛选
+        # ── 筛选栏 ──
         ttk.Separator(select_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
-        ttk.Label(select_frame, text="筛选组:").pack(side=tk.LEFT, padx=(5, 2))
+
+        ttk.Label(select_frame, text="组:").pack(side=tk.LEFT, padx=(5, 1))
         self.group_filter_var = tk.StringVar(value="全部")
-        self.group_filter_combo = ttk.Combobox(select_frame, textvariable=self.group_filter_var, width=10,
+        self.group_filter_combo = ttk.Combobox(select_frame, textvariable=self.group_filter_var, width=8,
                                                state="readonly")
         self.group_filter_combo['values'] = ["全部"]
-        self.group_filter_combo.pack(side=tk.LEFT, padx=2)
-        self.group_filter_combo.bind('<<ComboboxSelected>>', self.on_group_filter_change)
+        self.group_filter_combo.pack(side=tk.LEFT, padx=1)
+        self.group_filter_combo.bind('<<ComboboxSelected>>', self.on_proxy_filter_change)
+
+        ttk.Label(select_frame, text="状态:").pack(side=tk.LEFT, padx=(5, 1))
+        self.status_filter_var = tk.StringVar(value="全部")
+        self.status_filter_combo = ttk.Combobox(select_frame, textvariable=self.status_filter_var, width=8,
+                                                state="readonly")
+        self.status_filter_combo['values'] = ["全部", "活跃", "离线"]
+        self.status_filter_combo.pack(side=tk.LEFT, padx=1)
+        self.status_filter_combo.bind('<<ComboboxSelected>>', self.on_proxy_filter_change)
+
+        ttk.Label(select_frame, text="平台:").pack(side=tk.LEFT, padx=(5, 1))
+        self.platform_filter_var = tk.StringVar(value="全部")
+        self.platform_filter_combo = ttk.Combobox(select_frame, textvariable=self.platform_filter_var, width=8,
+                                                  state="readonly")
+        self.platform_filter_combo['values'] = ["全部", "阿里云", "腾讯云", "本机", "其他"]
+        self.platform_filter_combo.pack(side=tk.LEFT, padx=1)
+        self.platform_filter_combo.bind('<<ComboboxSelected>>', self.on_proxy_filter_change)
+
+        ttk.Label(select_frame, text="部署:").pack(side=tk.LEFT, padx=(5, 1))
+        self.deploy_filter_var = tk.StringVar(value="全部")
+        self.deploy_filter_combo = ttk.Combobox(select_frame, textvariable=self.deploy_filter_var, width=8,
+                                                state="readonly")
+        self.deploy_filter_combo['values'] = ["全部", "✅ 成功", "❌ 失败", "未部署"]
+        self.deploy_filter_combo.pack(side=tk.LEFT, padx=1)
+        self.deploy_filter_combo.bind('<<ComboboxSelected>>', self.on_proxy_filter_change)
+
+        ttk.Label(select_frame, text="IP:").pack(side=tk.LEFT, padx=(5, 1))
+        self.ip_filter_var = tk.StringVar()
+        self.ip_filter_entry = ttk.Entry(select_frame, textvariable=self.ip_filter_var, width=12)
+        self.ip_filter_entry.pack(side=tk.LEFT, padx=1)
+        self.ip_filter_var.trace_add('write', self._on_ip_filter_input)
 
         # 代理列表 - 增加 服务器平台 / 部署状态 两列只读
         columns = ("选择", "ID", "名称", "端口", "服务器IP", "组", "服务器平台", "部署状态", "状态", "检查时间")
@@ -1189,6 +1220,7 @@ class ProxyManagerGUI:
         self.proxy_tree.column("检查时间", width=65, anchor="center")
 
         self.proxy_tree.bind('<ButtonRelease-1>', self.on_proxy_click)
+        self.proxy_tree.bind('<Button-3>', self._on_proxy_right_click)      # 右键复制 IP
 
         scrollbar = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.proxy_tree.yview)
         self.proxy_tree.configure(yscrollcommand=scrollbar.set)
@@ -1212,6 +1244,7 @@ class ProxyManagerGUI:
         single_frame.pack(fill=tk.X, pady=(0, 5))
 
         ttk.Button(single_frame, text="🔍 测试选中", width=btn_width, command=self.test_selected_proxies).pack(pady=2)
+        ttk.Button(single_frame, text="📋 复制IP", width=btn_width, command=self._copy_proxy_ips).pack(pady=2)
         ttk.Button(single_frame, text="❌ 删除选中", width=btn_width, command=self.delete_selected_proxies).pack(pady=2)
 
         batch_frame = ttk.LabelFrame(right_frame, text="批量操作", padding="5")
@@ -1718,6 +1751,57 @@ class ProxyManagerGUI:
                         self.selected_proxy_ids.add(proxy_id)
                     self.update_proxy_selection_display()
 
+    def _on_proxy_right_click(self, event):
+        """右键弹出菜单：复制 IP"""
+        item = self.proxy_tree.identify_row(event.y)
+        if not item:
+            return
+        values = self.proxy_tree.item(item, 'values')
+        if len(values) < 5:
+            return
+        clicked_ip = values[4]  # 服务器IP
+        proxy_id = int(values[1])
+
+        # 如果右键的行未被选中，临时以该行为准
+        if proxy_id not in self.selected_proxy_ids:
+            ips = [clicked_ip]
+        else:
+            ips = self._get_selected_proxy_ips()
+
+        if not ips:
+            return
+
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(
+            label=f"📋 复制 IP ({len(ips)} 台)",
+            command=lambda: self._do_copy_ips(ips),
+        )
+        menu.post(event.x_root, event.y_root)
+
+    def _copy_proxy_ips(self):
+        """按钮回调：复制所有选中代理的 IP"""
+        ips = self._get_selected_proxy_ips()
+        if not ips:
+            messagebox.showwarning("提示", "请先选择代理")
+            return
+        self._do_copy_ips(ips)
+
+    def _get_selected_proxy_ips(self):
+        """从 Treeview 中提取所有选中代理的服务器 IP"""
+        ips = []
+        for item in self.proxy_tree.get_children():
+            values = self.proxy_tree.item(item, 'values')
+            if len(values) >= 2 and int(values[1]) in self.selected_proxy_ids:
+                ips.append(values[4])  # 服务器IP
+        return ips
+
+    def _do_copy_ips(self, ips):
+        """将 IP 列表写入剪贴板"""
+        text = '\n'.join(ips)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.on_log_message(f"已复制 {len(ips)} 个 IP 到剪贴板", LogLevel.SUCCESS)
+
     def edit_single_proxy_group(self, proxy_id, current_group):
         """编辑单个代理的组"""
         dialog = tk.Toplevel(self.root)
@@ -1793,8 +1877,12 @@ class ProxyManagerGUI:
 
         proxies = self.manager.database.get_all_proxies_with_details()
 
-        # 获取组筛选条件
-        filter_group = self.group_filter_var.get()
+        # 获取所有筛选条件
+        filter_group    = self.group_filter_var.get()
+        filter_status   = self.status_filter_var.get()
+        filter_platform = self.platform_filter_var.get()
+        filter_deploy   = self.deploy_filter_var.get()
+        filter_ip       = self.ip_filter_var.get().strip()
 
         # 平台 / 部署状态 文案映射
         _platform_label = {'auto': '未探测', 'aliyun': '阿里云', 'tencent': '腾讯云', 'default': '其他'}
@@ -1815,11 +1903,29 @@ class ProxyManagerGUI:
 
             is_active = self.manager.status_monitor.proxy_status_cache.get(port, False)
 
+            # 状态筛选
+            if filter_status == "活跃" and not is_active:
+                continue
+            if filter_status == "离线" and is_active:
+                continue
+
+            # 平台筛选
+            platform_text = _platform_label.get(cloud_provider, cloud_provider)
+            if filter_platform != "全部" and platform_text != filter_platform:
+                continue
+
+            # 部署状态筛选
+            deploy_text = _deploy_label.get(last_deploy_status, last_deploy_status)
+            if filter_deploy != "全部" and deploy_text != filter_deploy:
+                continue
+
+            # IP 模糊搜索
+            if filter_ip and filter_ip not in server_host:
+                continue
+
             last_check_time = get_beijing_time_short()
             status_text = "✅ 活跃" if is_active else "❌ 离线"
             select_mark = "☑" if proxy_id in self.selected_proxy_ids else "☐"
-            platform_text = _platform_label.get(cloud_provider, cloud_provider)
-            deploy_text   = _deploy_label.get(last_deploy_status, last_deploy_status)
 
             self.proxy_tree.insert("", tk.END, values=(
                 select_mark, proxy_id, proxy_name, port, server_host, group_name,
@@ -1838,9 +1944,17 @@ class ProxyManagerGUI:
         groups = self.manager.database.get_all_groups()
         self.group_filter_combo['values'] = ["全部"] + groups
 
-    def on_group_filter_change(self, event=None):
-        """组筛选变化时刷新列表"""
+    def on_proxy_filter_change(self, event=None):
+        """任一筛选条件变化时刷新列表"""
         self.refresh_proxy_list_internal()
+
+    _ip_filter_timer = None
+
+    def _on_ip_filter_input(self, *args):
+        """IP 搜索框输入防抖（300ms），避免每敲一个字符就刷新"""
+        if self._ip_filter_timer:
+            self.root.after_cancel(self._ip_filter_timer)
+        self._ip_filter_timer = self.root.after(300, self.on_proxy_filter_change)
 
     def start_all_proxies(self):
         if not self.manager:
@@ -2460,8 +2574,11 @@ class ProxyManagerGUI:
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
 
-        self.agent_progress_label = ttk.Label(toolbar, text="", foreground="gray")
-        self.agent_progress_label.pack(side=tk.RIGHT, padx=10)
+        self.agent_progress_label = ttk.Label(toolbar, text="", foreground="gray", font=("", 10))
+        self.agent_progress_label.pack(side=tk.RIGHT, padx=(0, 10))
+
+        self.agent_stats_label = ttk.Label(toolbar, text="", foreground="#333333", font=("", 10))
+        self.agent_stats_label.pack(side=tk.RIGHT, padx=5)
 
         # ── 服务器列表 ──────────────────────────────────────
         list_frame = ttk.LabelFrame(frame, text="云服务器列表", padding="3")
@@ -2534,6 +2651,21 @@ class ProxyManagerGUI:
                 '—', '—', '—', '—', '',
             ))
         self._agent_update_select_label()
+        self._agent_update_summary()
+
+    def _agent_update_summary(self):
+        """更新工具栏的部署统计标签（部署成功/失败/未部署）"""
+        try:
+            servers = self.agent_manager.get_all_servers() if self.agent_manager else []
+            n_total = len([s for s in servers if not s.get('is_local')])
+            n_success = sum(1 for s in servers if not s.get('is_local') and s.get('last_deploy_status') == 'success')
+            n_failed = sum(1 for s in servers if not s.get('is_local') and s.get('last_deploy_status') == 'failed')
+            n_never = n_total - n_success - n_failed
+            self.agent_stats_label.config(
+                text=f"📊 共{n_total}台  ✅{n_success}  ❌{n_failed}  ⬚{n_never}"
+            )
+        except Exception:
+            pass
 
     def _agent_log(self, msg, level='INFO'):
         """将 Agent 操作日志转发到系统日志"""
@@ -2616,7 +2748,7 @@ class ProxyManagerGUI:
             try:
                 if self.agent_tree.exists(iid):
                     vals = list(self.agent_tree.item(iid, 'values'))
-                    vals[11] = msg
+                    vals[12] = msg
                     self.agent_tree.item(iid, values=vals)
             except Exception:
                 pass
@@ -2635,10 +2767,11 @@ class ProxyManagerGUI:
 
     def _classify_for_deploy(self, ids):
         """把选中的 server ID 按部署状态分组（用于确认弹窗）。
-        返回 dict { 'in_progress': [...], 'success': [...], 'todo': [...] }
+        返回 dict { 'in_progress': [...], 'success': [...], 'todo': [...], 'local_ids': [...] }
         - in_progress: 正在部署中（_deploying_ids）→ 应自动跳过
         - success    : last_deploy_status == 'success' → 用户决定是否重部署
         - todo       : 其它（never / failed）→ 待部署
+        - local_ids  : 本机，单独列出（不参与上述分类）
         """
         deploying = self.agent_manager.get_deploying_ids() if self.agent_manager else set()
         try:
@@ -2646,27 +2779,32 @@ class ProxyManagerGUI:
         except Exception:
             servers = []
         status_map = {s['id']: (s.get('last_deploy_status') or 'never') for s in servers}
+        local_ids = [s['id'] for s in servers if s.get('is_local')]
+        local_set = set(local_ids)
 
         in_progress, success, todo = [], [], []
         for sid in ids:
+            if sid in local_set:
+                continue  # 本机单独通过"跳过本机"勾选框处理
             if sid in deploying:
                 in_progress.append(sid)
             elif status_map.get(sid) == 'success':
                 success.append(sid)
             else:
                 todo.append(sid)
-        return {'in_progress': in_progress, 'success': success, 'todo': todo}
+        return {'in_progress': in_progress, 'success': success, 'todo': todo, 'local_ids': local_ids}
 
     def _show_deploy_confirm_dialog(self, classification, mode_label):
-        """部署前确认弹窗，带"跳过已部署成功的"checkbox。
-        返回 (confirmed: bool, skip_success: bool)
+        """部署前确认弹窗，带"跳过已部署成功的"和"跳过本机"checkbox。
+        返回 (confirmed: bool, skip_success: bool, skip_local: bool)
         """
         n_progress = len(classification['in_progress'])
         n_success  = len(classification['success'])
         n_todo     = len(classification['todo'])
+        n_local    = len(classification.get('local_ids', []))
         total      = n_progress + n_success + n_todo
 
-        result = {'confirmed': False, 'skip_success': False}
+        result = {'confirmed': False, 'skip_success': False, 'skip_local': False}
 
         dialog = tk.Toplevel(self.root)
         dialog.title(f"确认部署 — {mode_label}")
@@ -2705,15 +2843,27 @@ class ProxyManagerGUI:
             ).pack(padx=20, anchor=tk.W)
         # （文案与上方"已部署成功 / 未部署/失败"对齐；勾上后只跑后者）
 
+        skip_local_var = tk.BooleanVar(value=True)
+        if n_local > 0:
+            ttk.Separator(dialog, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=20, pady=8)
+            ttk.Checkbutton(
+                dialog,
+                text=f"跳过本机（🖥 本机 × {n_local} 台）",
+                variable=skip_local_var,
+            ).pack(padx=20, anchor=tk.W)
+
         # 实际进入部署数实时计算
         actual = ttk.Label(dialog, foreground="green", font=("", 9, "bold"))
         actual.pack(padx=20, pady=(10, 5), anchor=tk.W)
 
         def _update_actual(*args):
             n = n_todo if skip_var.get() else (n_todo + n_success)
+            if not skip_local_var.get():
+                n = n + n_local
             actual.config(text=f"实际进入部署：{n} 台")
         _update_actual()
         skip_var.trace_add('write', _update_actual)
+        skip_local_var.trace_add('write', _update_actual)
 
         btns = ttk.Frame(dialog)
         btns.pack(pady=15)
@@ -2721,6 +2871,7 @@ class ProxyManagerGUI:
         def on_ok():
             result['confirmed'] = True
             result['skip_success'] = skip_var.get()
+            result['skip_local'] = skip_local_var.get()
             dialog.destroy()
 
         def on_cancel():
@@ -2737,7 +2888,7 @@ class ProxyManagerGUI:
         dialog.geometry(f"+{x}+{y}")
 
         dialog.wait_window()
-        return result['confirmed'], result['skip_success']
+        return result['confirmed'], result['skip_success'], result['skip_local']
 
     def _agent_batch_deploy(self):
         ids = self._get_agent_targets()
@@ -2745,12 +2896,14 @@ class ProxyManagerGUI:
             return
 
         cls = self._classify_for_deploy(ids)
-        confirmed, skip_success = self._show_deploy_confirm_dialog(cls, mode_label='精简 Agent 模式')
+        confirmed, skip_success, skip_local = self._show_deploy_confirm_dialog(cls, mode_label='精简 Agent 模式')
         if not confirmed:
             return
 
         # 计算最终下发列表：todo 永远在内；success 视 checkbox 决定；in_progress 始终丢弃
         deploy_ids = list(cls['todo']) + ([] if skip_success else list(cls['success']))
+        if not skip_local:
+            deploy_ids = deploy_ids + list(cls['local_ids'])
         if not deploy_ids:
             messagebox.showinfo("提示", "没有需要部署的服务器")
             return
@@ -2803,11 +2956,13 @@ class ProxyManagerGUI:
         ):
             return
 
-        confirmed, skip_success = self._show_deploy_confirm_dialog(cls, mode_label='完整项目模式')
+        confirmed, skip_success, skip_local = self._show_deploy_confirm_dialog(cls, mode_label='完整项目模式')
         if not confirmed:
             return
 
         deploy_ids = list(cls['todo']) + ([] if skip_success else list(cls['success']))
+        if not skip_local:
+            deploy_ids = deploy_ids + list(cls['local_ids'])
         if not deploy_ids:
             messagebox.showinfo("提示", "没有需要部署的服务器")
             return
@@ -2953,7 +3108,7 @@ class ProxyManagerGUI:
 
         frm = ttk.Frame(dlg, padding="10")
         frm.pack()
-        ttk.Label(frm, text="GitHub 仓库 URL（默认 master 分支打包下载）:").pack(anchor=tk.W)
+        ttk.Label(frm, text="GitHub 源码 zip 下载 URL:").pack(anchor=tk.W)
 
         url_var = tk.StringVar(value=GITHUB_REPO_URL)
         entry = ttk.Entry(frm, textvariable=url_var, width=60)
@@ -3002,8 +3157,8 @@ class ProxyManagerGUI:
         def do_pull():
             import urllib.request, io
             try:
-                # 拼接 zip 下载 URL: https://.../archive/refs/heads/master.zip
-                zip_url = repo_url.rstrip('/') + '/archive/refs/heads/master.zip'
+                # 直接使用用户输入的 URL，不做任何转换
+                zip_url = repo_url
                 self._agent_log(f"下载 {zip_url} ...", 'INFO')
                 self._agent_set_progress("GitHub 拉取：下载中...")
 
